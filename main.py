@@ -2,6 +2,7 @@ import os
 import re
 import aiohttp
 import asyncio
+import threading
 from pathlib import Path
 from datetime import datetime
 from pyrogram import Client, filters
@@ -11,11 +12,13 @@ from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 import subprocess
 import traceback
+from flask import Flask
 
 # Environment variables থেকে নিন
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "5000"))
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
@@ -27,6 +30,7 @@ ADMIN_ID = 6473423613  # আপনার Telegram user id এখানে রা
 MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB max size
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+flask_app = Flask(__name__)
 
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
@@ -69,7 +73,7 @@ async def progress_callback(current, total, message: Message, start_time, task="
         percentage = (current * 100 / total) if total else 0
         speed = (current / diff / 1024 / 1024) if diff else 0  # MB/s
         elapsed = int(diff)
-        eta = int((total - current) / (current / diff)) if current and diff else 0
+        eta = int((total - current) / (current / diff)) if current and diff and (current / diff) else 0
 
         done_blocks = int(percentage // 5)
         if done_blocks < 0:
@@ -91,6 +95,19 @@ async def progress_callback(current, total, message: Message, start_time, task="
             pass
     except Exception:
         pass
+
+# wrapper for pyrogram progress callbacks (they are sync calls)
+def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
+    try:
+        # ensure we have an asyncio loop and schedule the async progress_callback
+        loop = asyncio.get_event_loop()
+        loop.create_task(progress_callback(current, total, message_obj, start_time_obj, task=task_str))
+    except RuntimeError:
+        # if no running loop, schedule on new loop
+        try:
+            asyncio.run(progress_callback(current, total, message_obj, start_time_obj, task=task_str))
+        except Exception:
+            pass
 
 async def download_stream(resp, out_path: Path, message: Message = None, start_time=None, task="Downloading", cancel_event: asyncio.Event = None):
     total = 0
@@ -266,8 +283,19 @@ async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
         print(f"Thumbnail generate error: {e}")
         return False
 
-async def upload_progress(current, total, message: Message, start_time):
+async def upload_progress_async(current, total, message: Message, start_time):
     await progress_callback(current, total, message, start_time, task="Uploading")
+
+# wrapper used by pyrogram for upload progress
+def pyrogram_upload_wrapper(current, total, message_obj, start_time_obj):
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(upload_progress_async(current, total, message_obj, start_time_obj))
+    except RuntimeError:
+        try:
+            asyncio.run(upload_progress_async(current, total, message_obj, start_time_obj))
+        except Exception:
+            pass
 
 async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None):
     uid = m.from_user.id
@@ -302,13 +330,14 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 
         try:
             if is_video:
+                # pyrogram's send_video accepts progress and progress_args
                 await c.send_video(
                     chat_id=m.chat.id,
                     video=str(in_path),
                     caption=final_name,
                     thumb=thumb_path,
                     duration=duration_sec,
-                    progress=upload_progress,
+                    progress=pyrogram_upload_wrapper,
                     progress_args=(status_msg, start_time)
                 )
             else:
@@ -317,7 +346,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                     document=str(in_path),
                     file_name=final_name,
                     caption=final_name,
-                    progress=upload_progress,
+                    progress=pyrogram_upload_wrapper,
                     progress_args=(status_msg, start_time)
                 )
             await status_msg.edit("আপলোড সম্পন্ন।", reply_markup=None)
@@ -397,6 +426,7 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
         except Exception:
             pass
 
+# --- forwarded video handler with download progress + upload progress ---
 @app.on_message(filters.video & filters.private & filters.forwarded)
 async def video_forward_rename(c: Client, m: Message):
     uid = m.from_user.id
@@ -407,18 +437,25 @@ async def video_forward_rename(c: Client, m: Message):
         await m.reply_text("এক সময়ে শুধু একটি কাজ করা যাবে। দয়া করে শেষ হওয়া পর্যন্ত অপেক্ষা করুন।")
         return
 
-    tmp_video_path = TMP / f"new_video.mp4"
+    tmp_video_path = TMP / f"new_video_{uid}_{int(datetime.now().timestamp())}.mp4"
+    status_msg = await m.reply_text("Forwarded ভিডিও ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    TASKS[uid] = asyncio.Event()  # create cancel event
     try:
-        await m.download(file_name=str(tmp_video_path))
-        TASKS[uid] = asyncio.Event()  # create cancel event
-        await process_file_and_upload(c, m, tmp_video_path, original_name="new_video.mp4")
+        start_time = datetime.now()
+        # use pyrogram download with progress callback to show live download progress
+        await m.download(file_name=str(tmp_video_path),
+                         progress=pyrogram_progress_wrapper,
+                         progress_args=(status_msg, start_time, "Downloading"))
+        # after download complete, start upload process (this will show upload progress)
+        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        await process_file_and_upload(c, m, tmp_video_path, original_name=tmp_video_path.name)
     except Exception as e:
         await m.reply_text(f"ভিডিও প্রসেসিংয়ে সমস্যা: {e}")
     finally:
         TASKS.pop(uid, None)
 
 @app.on_message(filters.command("rename") & filters.private)
-async def rename_cmd(c: Client, m: Message):
+async def rename_cmd(c, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         await m.reply_text("আপনার অনুমতি নেই।")
@@ -433,8 +470,6 @@ async def rename_cmd(c: Client, m: Message):
     # নিরাপদ নাম তৈরির জন্য
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
     await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(এই ফিচারটি আপনার নিজস্ব ভিডিও জন্য কার্যকর, ফরোয়ার্ড ভিডিওর জন্য নয়)")
-    # এখানে আপনার ভিডিও ডাউনলোড এবং upload কোড দিতে পারেন
-    # কিন্তু এই বটে কাজ করা আছে ভিডিও ফরোয়ার্ড অটো rename ফাংশনে
 
 @app.on_callback_query(filters.regex("cancel_task"))
 async def cancel_task_cb(c, cb):
@@ -474,6 +509,19 @@ async def auto_url_upload(c, m: Message):
         # url detected
         await handle_url_download_and_upload(c, m, text)
 
+# Flask route to keep web service port open for Render
+@flask_app.route("/")
+def home():
+    return "Bot is running (Flask alive)."
+
+def run_flask():
+    # run flask in a separate thread so pyrogram can run in main thread
+    flask_app.run(host="0.0.0.0", port=PORT)
+
 if __name__ == "__main__":
-    print("Bot চালু হয়েছে...")
+    print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
+    # start flask in background thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    # run pyrogram (this blocks)
     app.run()
