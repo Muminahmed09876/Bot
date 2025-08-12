@@ -31,14 +31,14 @@ TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
 
 # state
-USER_THUMBS = {}             # uid -> thumb path
-LAST_FILE = {}               # uid -> last file metadata
-TASKS = {}                   # uid -> list of asyncio.Event (cancel events)
-SET_THUMB_REQUEST = set()    # uid set that recently ran /setthumb (next photo is explicit)
-SUBSCRIBERS = set()          # chat ids who started the bot (for broadcast)
+USER_THUMBS = {}
+LAST_FILE = {}
+TASKS = {}
+SET_THUMB_REQUEST = set()
+SUBSCRIBERS = set()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+MAX_SIZE = 2 * 1024 * 1024 * 1024
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
@@ -51,7 +51,6 @@ def is_drive_url(url: str) -> bool:
     return "drive.google.com" in url or "docs.google.com" in url
 
 def extract_drive_id(url: str) -> str:
-    # common patterns
     patterns = [
         r"/d/([a-zA-Z0-9_-]+)",
         r"id=([a-zA-Z0-9_-]+)",
@@ -88,7 +87,7 @@ async def progress_callback(current, total, message: Message, start_time, task="
         if diff < 0.001:
             diff = 0.001
         percentage = (current * 100 / total) if total else 0
-        speed = (current / diff / 1024 / 1024) if diff else 0  # MB/s
+        speed = (current / diff / 1024 / 1024) if diff else 0
         elapsed = int(diff)
         eta = int((total - current) / (current / diff)) if current and diff and (current / diff) else 0
 
@@ -111,23 +110,16 @@ async def progress_callback(current, total, message: Message, start_time, task="
         pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
-    """
-    This wrapper is safe to be called from sync context (pyrogram progress).
-    We try to schedule the coroutine on the running loop.
-    """
     try:
         loop = asyncio.get_event_loop()
-        # If loop is running, schedule thread-safe
         try:
             asyncio.run_coroutine_threadsafe(progress_callback(current, total, message_obj, start_time_obj, task=task_str), loop)
         except Exception:
-            # fallback: fire-and-forget using create_task if we're in same thread
             try:
-                loop.create_task(progress_callback(current, total, message_obj, start_time_obj, task=task_str))
+                loop.create_task(progress_callback(current, total, message_obj, start_time_obj))
             except Exception:
                 pass
     except RuntimeError:
-        # no event loop in this thread; ignore
         pass
 
 # ---- robust download stream with retries ----
@@ -137,7 +129,7 @@ async def download_stream(resp, out_path: Path, message: Message = None, start_t
         size = int(resp.headers.get("Content-Length", 0))
     except:
         size = 0
-    chunk_size = 1024 * 1024  # 1MB chunk - larger chunk reduces overhead, helps big files
+    chunk_size = 1024 * 1024
     try:
         with out_path.open("wb") as f:
             async for chunk in resp.content.iter_chunked(chunk_size):
@@ -169,7 +161,7 @@ async def fetch_with_retries(session, url, method="GET", max_tries=3, **kwargs):
     raise RuntimeError("unreachable")
 
 async def download_url_generic(url: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
-    timeout = aiohttp.ClientTimeout(total=7200)  # larger timeout
+    timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
     connector = aiohttp.TCPConnector(limit=0, force_close=True)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as sess:
@@ -182,12 +174,6 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
             return False, str(e)
 
 async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
-    """
-    Improved Google Drive download handling:
-    - Try direct uc?export=download first
-    - If confirm token presented in HTML, extract token and re-request with confirm
-    - Handle cookie 'download_warning' style tokens
-    """
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -195,11 +181,9 @@ async def download_drive_file(file_id: str, out_path: Path, message: Message = N
     async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as sess:
         try:
             async with sess.get(base, allow_redirects=True) as resp:
-                # direct file
                 if resp.status == 200 and "content-disposition" in (k.lower() for k in resp.headers.keys()):
                     return await download_stream(resp, out_path, message, datetime.now(), task="Downloading", cancel_event=cancel_event)
                 text = await resp.text(errors="ignore")
-                # try to find confirm token
                 m = re.search(r"confirm=([0-9A-Za-z-_]+)", text)
                 if m:
                     token = m.group(1)
@@ -208,7 +192,6 @@ async def download_drive_file(file_id: str, out_path: Path, message: Message = N
                         if resp2.status != 200:
                             return False, f"HTTP {resp2.status}"
                         return await download_stream(resp2, out_path, message, datetime.now(), task="Downloading", cancel_event=cancel_event)
-                # sometimes token is in cookies as download_warning_
                 for k, v in resp.cookies.items():
                     if k.startswith("download_warning"):
                         token = v.value
@@ -228,7 +211,7 @@ async def set_bot_commands():
         BotCommand("setthumb", "কাস্টম থাম্বনেইল সেট করুন (admin only)"),
         BotCommand("view_thumb", "আপনার থাম্বনেইল দেখুন (admin only)"),
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
-        BotCommand("rename", "reply করা ভিডিও/ডকুমেন্ট রিনেম করুন (admin only)"),
+        BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -241,7 +224,6 @@ async def set_bot_commands():
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(c, m: Message):
     await set_bot_commands()
-    # add to subscribers for broadcast
     SUBSCRIBERS.add(m.chat.id)
     text = (
         "Hi! আমি URL uploader bot.\n\n"
@@ -251,8 +233,8 @@ async def start_handler(c, m: Message):
         "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
         "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
-        "/rename <newname.ext> - reply করা ভিডিও/ডকুমেন্ট রিনেম করুন (admin only)\n"
-        "/broadcast <text/reply to media> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
+        "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
     await m.reply_text(text)
@@ -348,6 +330,10 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
         fname = url.split("/")[-1].split("?")[0] or f"download_{int(datetime.now().timestamp())}"
         safe_name = re.sub(r"[\\/*?\"<>|:]", "_", fname)
 
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        if not any(safe_name.lower().endswith(ext) for ext in video_exts):
+            safe_name += ".mp4"
+
         tmp_in = TMP / f"dl_{uid}_{int(datetime.now().timestamp())}_{safe_name}"
         ok, err = False, None
 
@@ -371,10 +357,8 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             TASKS[uid].remove(cancel_event)
             return
 
-        is_video = tmp_in.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
-        
-        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন ফাইল প্রসেসিং ও আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, is_video=is_video)
+        await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        await process_file_and_upload(c, m, tmp_in, original_name=safe_name)
     except Exception as e:
         traceback.print_exc()
         await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
@@ -384,38 +368,30 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
         except Exception:
             pass
 
-@app.on_message(filters.video & filters.private & filters.forwarded | filters.document & filters.private & filters.forwarded)
-async def media_forward_rename(c: Client, m: Message):
+# *** সংশোধিত: ভিডিও এবং ডকুমেন্ট ফরওয়ার্ড হ্যান্ডলার ***
+@app.on_message(filters.private & filters.forwarded & (filters.video | filters.document))
+async def forwarded_file_rename(c: Client, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
-
-    file_obj = m.video or m.document
-    if not file_obj:
+    
+    file_info = m.video or m.document
+    if not file_info or not file_info.file_name:
+        await m.reply_text("ফাইলটির কোনো নাম নেই, তাই রিনেম করা সম্ভব নয়।")
+        TASKS[uid].remove(cancel_event)
         return
 
-    original_file_name = file_obj.file_name
-    file_ext = Path(original_file_name).suffix
-    
-    timestamp = int(datetime.now().timestamp())
-    new_file_name = f"renamed_file_{uid}_{timestamp}{file_ext}"
-
-    tmp_path = TMP / new_file_name
-    
-    status_msg = await m.reply_text("Forwarded ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{file_info.file_name}"
+    status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
     try:
         start_time = datetime.now()
         await m.download(file_name=str(tmp_path),
                          progress=pyrogram_progress_wrapper,
                          progress_args=(status_msg, start_time, "Downloading"))
-        
-        is_video = m.video is not None
-        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন ফাইল প্রসেসিং ও আপলোড হচ্ছে...", reply_markup=None)
-            
-        await process_file_and_upload(c, m, tmp_path, original_name=new_file_name, is_video=is_video)
+        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        await process_file_and_upload(c, m, tmp_path, original_name=tmp_path.name)
     except Exception as e:
         await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
     finally:
@@ -438,7 +414,7 @@ async def rename_cmd(c, m: Message):
         return
     new_name = m.text.split(None, 1)[1].strip()
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
-    await m.reply_text(f"ভিডিও/ডকুমেন্ট রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
+    await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
 
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -447,10 +423,8 @@ async def rename_cmd(c, m: Message):
     try:
         start_time = datetime.now()
         await m.reply_to_message.download(file_name=str(tmp_out), progress=pyrogram_progress_wrapper, progress_args=(status_msg, start_time, "Downloading"))
-        
-        is_video = m.reply_to_message.video is not None
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_out, original_name=new_name, is_video=is_video)
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name)
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
@@ -492,27 +466,45 @@ async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
         logger.warning("Thumbnail generate error: %s", e)
         return False
 
-async def convert_to_mp4(in_path: Path, out_path: Path) -> bool:
+# *** নতুন: ভিডিও কনভার্সন ফাংশন ***
+async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
     try:
+        await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...")
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-crf", "23",
-            "-f", "mp4",
-            "-y",
+            "-codec", "copy",  # শুধুমাত্র কন্টেইনার পরিবর্তন
             str(out_path)
         ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return out_path.exists()
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg conversion failed: {e}")
-        return False
-    except FileNotFoundError:
-        logger.error("FFmpeg not found. Please make sure it is installed and in your PATH.")
-        return False
+        
+        # যদি ভিডিও ফাইলটি কনটেইনার পরিবর্তন করে কাজ না করে, তাহলে ফুল এনকোডিং করবে।
+        # এটি ভিডিও সাইজ কিছুটা পরিবর্তন করতে পারে, কিন্তু সকল ডিভাইসে চলবে।
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1200)
+        
+        if result.returncode != 0:
+            logger.warning("Container conversion failed, attempting full re-encoding: %s", result.stderr)
+            await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...")
+            cmd_full = [
+                "ffmpeg",
+                "-i", str(in_path),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "copy",
+                str(out_path)
+            ]
+            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=False, timeout=3600)
+            if result_full.returncode != 0:
+                raise Exception(f"Full re-encoding failed: {result_full.stderr}")
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise Exception("Converted file not found or is empty.")
+        
+        return True, None
+    except Exception as e:
+        logger.error("Video conversion error: %s", e)
+        return False, str(e)
+
 
 async def upload_progress_async(current, total, message: Message, start_time):
     await progress_callback(current, total, message, start_time, task="Uploading")
@@ -530,35 +522,39 @@ def pyrogram_upload_wrapper(current, total, message_obj, start_time_obj):
     except RuntimeError:
         pass
 
-async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, is_video: bool = False):
+async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
-    temp_files_to_delete = []
-
+    upload_path = in_path
+    
     try:
         final_name = original_name or in_path.name
         thumb_path = USER_THUMBS.get(uid)
         if thumb_path and not Path(thumb_path).exists():
             thumb_path = None
 
-        converted_path = None
-        if is_video and in_path.suffix.lower() != ".mp4":
-            await m.reply_text(f"ভিডিও ফাইলটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=None)
-            converted_path = in_path.with_suffix(".mp4")
-            if await convert_to_mp4(in_path, converted_path):
-                temp_files_to_delete.append(in_path)
-                in_path = converted_path
-                final_name = Path(final_name).stem + ".mp4"
-            else:
-                await m.reply_text("ভিডিও কনভার্ট করতে ব্যর্থ হয়েছে, আসল ফাইল আপলোড করা হচ্ছে।")
+        is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
         
+        # *** নতুন লজিক: ভিডিও কনভার্সন ***
+        if is_video and in_path.suffix.lower() != ".mp4":
+            mp4_path = TMP / f"{in_path.stem}.mp4"
+            status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MP4 এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+            ok, err = await convert_to_mp4(in_path, mp4_path, status_msg)
+            if not ok:
+                await status_msg.edit(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
+                # Fallback to original file
+            else:
+                upload_path = mp4_path
+                final_name = f"{Path(final_name).stem}.mp4"
+                
+        # *** থাম্বনেইল জেনারেশন ***
         if is_video and not thumb_path:
             thumb_path_tmp = TMP / f"thumb_{uid}_{int(datetime.now().timestamp())}.jpg"
-            if await generate_video_thumbnail(in_path, thumb_path_tmp):
+            ok = await generate_video_thumbnail(upload_path, thumb_path_tmp)
+            if ok:
                 thumb_path = str(thumb_path_tmp)
-                temp_files_to_delete.append(thumb_path_tmp)
 
         status_msg = await m.reply_text("আপলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
         if cancel_event.is_set():
@@ -567,7 +563,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             return
         start_time = datetime.now()
 
-        duration_sec = get_video_duration(in_path) if in_path.exists() else 0
+        duration_sec = get_video_duration(upload_path) if upload_path.exists() else 0
 
         upload_attempts = 3
         last_exc = None
@@ -576,7 +572,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 if is_video:
                     await c.send_video(
                         chat_id=m.chat.id,
-                        video=str(in_path),
+                        video=str(upload_path),
                         caption=final_name,
                         thumb=thumb_path,
                         duration=duration_sec,
@@ -587,14 +583,14 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 else:
                     await c.send_document(
                         chat_id=m.chat.id,
-                        document=str(in_path),
+                        document=str(upload_path),
                         file_name=final_name,
                         caption=final_name,
                         progress=pyrogram_upload_wrapper,
                         progress_args=(status_msg, start_time)
                     )
                 await status_msg.edit("আপলোড সম্পন্ন।", reply_markup=None)
-                LAST_FILE[uid] = {"path": str(in_path), "name": final_name, "is_video": is_video, "thumb": thumb_path, "ts": datetime.now().isoformat()}
+                LAST_FILE[uid] = {"path": str(upload_path), "name": final_name, "is_video": is_video, "thumb": thumb_path, "ts": datetime.now().isoformat()}
                 last_exc = None
                 break
             except Exception as e:
@@ -611,66 +607,47 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         await m.reply_text(f"আপলোডে ত্রুটি: {e}")
     finally:
         try:
-            for f in temp_files_to_delete:
-                if Path(f).exists():
-                    Path(f).unlink()
-        except:
-            pass
-        try:
+            if upload_path != in_path and upload_path.exists():
+                upload_path.unlink()
+            if in_path.exists():
+                in_path.unlink()
+            if thumb_path and Path(thumb_path).exists():
+                Path(thumb_path).unlink()
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
 
-@app.on_message(filters.command("broadcast") & filters.private)
-async def broadcast_cmd(c, m: Message):
+# *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
+@app.on_message(filters.command("broadcast") & filters.private & filters.reply)
+async def broadcast_cmd_reply(c, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         await m.reply_text("আপনার অনুমতি নেই।")
         return
-
-    if m.reply_to_message:
-        broadcast_msg = m.reply_to_message
-        await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...")
-        failed = 0
-        sent = 0
-        for chat_id in list(SUBSCRIBERS):
-            if chat_id == m.chat.id:
-                continue
-            try:
-                await broadcast_msg.copy(chat_id)
-                sent += 1
-                await asyncio.sleep(0.08)
-            except Exception as e:
-                failed += 1
-                logger.warning("Broadcast to %s failed: %s", chat_id, e)
-                # If broadcast fails to a chat, remove it from the subscriber list
-                # This prevents repeated failures for blocked or inactive chats.
-                SUBSCRIBERS.discard(chat_id)
-                pass
-        
-        await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
     
-    elif len(m.command) >= 2:
-        text = m.text.split(None, 1)[1]
-        await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...")
-        failed = 0
-        sent = 0
-        for chat_id in list(SUBSCRIBERS):
-            try:
-                await c.send_message(chat_id, text)
-                sent += 1
-                await asyncio.sleep(0.08)
-            except Exception as e:
-                failed += 1
-                logger.warning("Broadcast to %s failed: %s", chat_id, e)
-                SUBSCRIBERS.discard(chat_id)
-                pass
-        
-        await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
-    
-    else:
-        await m.reply_text("ব্যবহার: /broadcast <reply to a message> অথবা /broadcast Your message here")
+    source_message = m.reply_to_message
+    if not source_message:
+        await m.reply_text("ব্রডকাস্ট করার জন্য একটি মেসেজে রিপ্লাই করে এই কমান্ড দিন।")
+        return
 
+    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...", quote=True)
+    failed = 0
+    sent = 0
+    for chat_id in list(SUBSCRIBERS):
+        if chat_id == m.chat.id: # নিজের চ্যাটে ফরওয়ার্ড করা বাদ দিতে
+            continue
+        try:
+            await c.forward_messages(chat_id=chat_id, from_chat_id=source_message.chat.id, message_ids=source_message.id)
+            sent += 1
+            await asyncio.sleep(0.08)
+        except Exception as e:
+            failed += 1
+            logger.warning("Broadcast to %s failed: %s", chat_id, e)
+
+    await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
+
+
+# Flask route to keep web service port open for Render
 @flask_app.route("/")
 def home():
     return "Bot is running (Flask alive)."
