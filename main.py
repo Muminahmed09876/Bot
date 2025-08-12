@@ -300,7 +300,6 @@ async def del_thumb_cmd(c, m: Message):
 
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(c, m: Message):
-    # only admin allowed to set thumb, but we support both auto-save and explicit /setthumb
     if not is_admin(m.from_user.id):
         return
     uid = m.from_user.id
@@ -312,7 +311,6 @@ async def photo_handler(c, m: Message):
         img = img.convert("RGB")
         img.save(out, "JPEG")
         USER_THUMBS[uid] = str(out)
-        # message depends if explicit or auto
         if uid in SET_THUMB_REQUEST:
             SET_THUMB_REQUEST.discard(uid)
             await m.reply_text("আপনার থাম্বনেইল সেভ হয়েছে।")
@@ -330,12 +328,10 @@ async def upload_url_cmd(c, m: Message):
         await m.reply_text("ব্যবহার: /upload_url <url>\nউদাহরণ: /upload_url https://example.com/file.mp4")
         return
     url = m.text.split(None, 1)[1].strip()
-    # launch as background task to allow many concurrent requests
     asyncio.create_task(handle_url_download_and_upload(c, m, url))
 
 @app.on_message(filters.text & filters.private)
 async def auto_url_upload(c, m: Message):
-    # admin-only: if user sends raw URL, auto start
     if not is_admin(m.from_user.id):
         return
     text = m.text.strip()
@@ -344,13 +340,11 @@ async def auto_url_upload(c, m: Message):
 
 async def handle_url_download_and_upload(c: Client, m: Message, url: str):
     uid = m.from_user.id
-    # create a cancel event and register it
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
 
     status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
     try:
-        # prepare safe filename
         fname = url.split("/")[-1].split("?")[0] or f"download_{int(datetime.now().timestamp())}"
         safe_name = re.sub(r"[\\/*?\"<>|:]", "_", fname)
 
@@ -369,7 +363,6 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
 
         if not ok:
             await status_msg.edit(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
-            # cleanup partial file
             try:
                 if tmp_in.exists():
                     tmp_in.unlink()
@@ -378,20 +371,19 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             TASKS[uid].remove(cancel_event)
             return
 
+        is_video = tmp_in.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন ফাইল প্রসেসিং ও আপলোড হচ্ছে...", reply_markup=None)
-        # process/upload (this will manage its own TASKS cancellation and cleanup)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name)
+        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, is_video=is_video)
     except Exception as e:
         traceback.print_exc()
         await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
     finally:
-        # remove cancel_event from TASKS list
         try:
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
 
-# forwarded video and document handler (download-forwarded + reupload)
 @app.on_message(filters.video & filters.private & filters.forwarded | filters.document & filters.private & filters.forwarded)
 async def media_forward_rename(c: Client, m: Message):
     uid = m.from_user.id
@@ -401,14 +393,8 @@ async def media_forward_rename(c: Client, m: Message):
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
 
-    if uid in TASKS and any(ev.is_set() for ev in TASKS.get(uid, [])):
-        pass
-
-    if m.video:
-        file_obj = m.video
-    elif m.document:
-        file_obj = m.document
-    else:
+    file_obj = m.video or m.document
+    if not file_obj:
         return
 
     original_file_name = file_obj.file_name
@@ -426,8 +412,10 @@ async def media_forward_rename(c: Client, m: Message):
                          progress=pyrogram_progress_wrapper,
                          progress_args=(status_msg, start_time, "Downloading"))
         
-        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_path, original_name=new_file_name)
+        is_video = m.video is not None
+        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন ফাইল প্রসেসিং ও আপলোড হচ্ছে...", reply_markup=None)
+            
+        await process_file_and_upload(c, m, tmp_path, original_name=new_file_name, is_video=is_video)
     except Exception as e:
         await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
     finally:
@@ -459,8 +447,10 @@ async def rename_cmd(c, m: Message):
     try:
         start_time = datetime.now()
         await m.reply_to_message.download(file_name=str(tmp_out), progress=pyrogram_progress_wrapper, progress_args=(status_msg, start_time, "Downloading"))
+        
+        is_video = m.reply_to_message.video is not None
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_out, original_name=new_name)
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name, is_video=is_video)
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
@@ -540,7 +530,7 @@ def pyrogram_upload_wrapper(current, total, message_obj, start_time_obj):
     except RuntimeError:
         pass
 
-async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None):
+async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, is_video: bool = False):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -553,21 +543,17 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         if thumb_path and not Path(thumb_path).exists():
             thumb_path = None
 
-        is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".mkv"}
-
-        # New: Video to MP4 conversion
         converted_path = None
         if is_video and in_path.suffix.lower() != ".mp4":
             await m.reply_text(f"ভিডিও ফাইলটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=None)
             converted_path = in_path.with_suffix(".mp4")
             if await convert_to_mp4(in_path, converted_path):
-                # Replace original path with converted path for further processing
                 temp_files_to_delete.append(in_path)
                 in_path = converted_path
+                final_name = Path(final_name).stem + ".mp4"
             else:
                 await m.reply_text("ভিডিও কনভার্ট করতে ব্যর্থ হয়েছে, আসল ফাইল আপলোড করা হচ্ছে।")
         
-        # New: Generate thumbnail after potential conversion
         if is_video and not thumb_path:
             thumb_path_tmp = TMP / f"thumb_{uid}_{int(datetime.now().timestamp())}.jpg"
             if await generate_video_thumbnail(in_path, thumb_path_tmp):
@@ -635,7 +621,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         except Exception:
             pass
 
-# ---- broadcast command for admin ----
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd(c, m: Message):
     uid = m.from_user.id
@@ -652,12 +637,15 @@ async def broadcast_cmd(c, m: Message):
             if chat_id == m.chat.id:
                 continue
             try:
-                await app.copy_message(chat_id, m.chat.id, broadcast_msg.id)
+                await broadcast_msg.copy(chat_id)
                 sent += 1
                 await asyncio.sleep(0.08)
             except Exception as e:
                 failed += 1
                 logger.warning("Broadcast to %s failed: %s", chat_id, e)
+                # If broadcast fails to a chat, remove it from the subscriber list
+                # This prevents repeated failures for blocked or inactive chats.
+                SUBSCRIBERS.discard(chat_id)
                 pass
         
         await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
@@ -669,12 +657,13 @@ async def broadcast_cmd(c, m: Message):
         sent = 0
         for chat_id in list(SUBSCRIBERS):
             try:
-                await app.send_message(chat_id, text)
+                await c.send_message(chat_id, text)
                 sent += 1
                 await asyncio.sleep(0.08)
             except Exception as e:
                 failed += 1
                 logger.warning("Broadcast to %s failed: %s", chat_id, e)
+                SUBSCRIBERS.discard(chat_id)
                 pass
         
         await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
@@ -682,7 +671,6 @@ async def broadcast_cmd(c, m: Message):
     else:
         await m.reply_text("ব্যবহার: /broadcast <reply to a message> অথবা /broadcast Your message here")
 
-# Flask route to keep web service port open for Render
 @flask_app.route("/")
 def home():
     return "Bot is running (Flask alive)."
@@ -690,7 +678,6 @@ def home():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
 
-# cleanup old tmp files (optional). Runs in background
 async def periodic_cleanup():
     while True:
         try:
@@ -704,14 +691,12 @@ async def periodic_cleanup():
                     pass
         except Exception:
             pass
-        await asyncio.sleep(3600)  # run every hour
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    # start flask in background thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    # schedule cleanup task
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(periodic_cleanup())
