@@ -378,12 +378,14 @@ async def forwarded_file_rename(c: Client, m: Message):
     TASKS.setdefault(uid, []).append(cancel_event)
     
     file_info = m.video or m.document
+    
+    # নতুন লজিক: যদি ফাইলের কোনো নাম না থাকে, তবে একটি ডিফল্ট নাম সেট করা হবে।
     if not file_info or not file_info.file_name:
-        await m.reply_text("ফাইলটির কোনো নাম নেই, তাই রিনেম করা সম্ভব নয়।")
-        TASKS[uid].remove(cancel_event)
-        return
+        original_name = f"new_file_{int(datetime.now().timestamp())}.mp4"
+    else:
+        original_name = file_info.file_name
 
-    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{file_info.file_name}"
+    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
     status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
     try:
         start_time = datetime.now()
@@ -391,7 +393,7 @@ async def forwarded_file_rename(c: Client, m: Message):
                          progress=pyrogram_progress_wrapper,
                          progress_args=(status_msg, start_time, "Downloading"))
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_path, original_name=tmp_path.name)
+        await process_file_and_upload(c, m, tmp_path, original_name=original_name)
     except Exception as e:
         await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
     finally:
@@ -473,12 +475,10 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
-            "-codec", "copy",  # শুধুমাত্র কন্টেইনার পরিবর্তন
+            "-codec", "copy",
             str(out_path)
         ]
         
-        # যদি ভিডিও ফাইলটি কনটেইনার পরিবর্তন করে কাজ না করে, তাহলে ফুল এনকোডিং করবে।
-        # এটি ভিডিও সাইজ কিছুটা পরিবর্তন করতে পারে, কিন্তু সকল ডিভাইসে চলবে।
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1200)
         
         if result.returncode != 0:
@@ -544,7 +544,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             ok, err = await convert_to_mp4(in_path, mp4_path, status_msg)
             if not ok:
                 await status_msg.edit(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
-                # Fallback to original file
             else:
                 upload_path = mp4_path
                 final_name = f"{Path(final_name).stem}.mp4"
@@ -634,7 +633,7 @@ async def broadcast_cmd_reply(c, m: Message):
     failed = 0
     sent = 0
     for chat_id in list(SUBSCRIBERS):
-        if chat_id == m.chat.id: # নিজের চ্যাটে ফরওয়ার্ড করা বাদ দিতে
+        if chat_id == m.chat.id:
             continue
         try:
             await c.forward_messages(chat_id=chat_id, from_chat_id=source_message.chat.id, message_ids=source_message.id)
