@@ -81,46 +81,12 @@ def progress_keyboard():
 
 # ---- progress callback helpers ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
-    try:
-        now = datetime.now()
-        diff = (now - start_time).total_seconds()
-        if diff < 0.001:
-            diff = 0.001
-        percentage = (current * 100 / total) if total else 0
-        speed = (current / diff / 1024 / 1024) if diff else 0
-        elapsed = int(diff)
-        eta = int((total - current) / (current / diff)) if current and diff and (current / diff) else 0
-
-        done_blocks = int(percentage // 5)
-        done_blocks = max(0, min(20, done_blocks))
-        progress_bar = ("█" * done_blocks).ljust(20, "░")
-        text = (
-            f"{task}...\n"
-            f"[{progress_bar}] {percentage:.2f}%\n"
-            f"{current / 1024 / 1024:.2f}MB of { (total / 1024 / 1024) if total else 0:.2f}MB\n"
-            f"Speed: {speed:.2f} MB/s\n"
-            f"Elapsed: {elapsed}s | ETA: {eta}s\n\n"
-            "আপলোড/ডাউনলোড বাতিল করতে নিচের বাটনে চাপুন।"
-        )
-        try:
-            await message.edit_text(text, reply_markup=progress_keyboard())
-        except Exception:
-            pass
-    except Exception:
-        pass
+    # Live progress is removed, just a dummy function now.
+    pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
-    try:
-        loop = asyncio.get_event_loop()
-        try:
-            asyncio.run_coroutine_threadsafe(progress_callback(current, total, message_obj, start_time_obj, task=task_str), loop)
-        except Exception:
-            try:
-                loop.create_task(progress_callback(current, total, message_obj, start_time_obj))
-            except Exception:
-                pass
-    except RuntimeError:
-        pass
+    # Live progress is removed.
+    pass
 
 # ---- robust download stream with retries ----
 async def download_stream(resp, out_path: Path, message: Message = None, start_time=None, task="Downloading", cancel_event: asyncio.Event = None):
@@ -141,8 +107,6 @@ async def download_stream(resp, out_path: Path, message: Message = None, start_t
                 if total > MAX_SIZE:
                     return False, "ফাইলের সাইজ 2GB এর বেশি হতে পারে না।"
                 f.write(chunk)
-                if message and start_time:
-                    await progress_callback(total, size, message, start_time, task=task)
     except Exception as e:
         return False, str(e)
     return True, None
@@ -358,7 +322,7 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             return
 
         await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name)
+        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, delete_after_upload=status_msg.id)
     except Exception as e:
         traceback.print_exc()
         await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
@@ -379,21 +343,17 @@ async def forwarded_file_rename(c: Client, m: Message):
     
     file_info = m.video or m.document
     
-    # নতুন লজিক: যদি ফাইলের কোনো নাম না থাকে, তবে একটি ডিফল্ট নাম সেট করা হবে।
     if not file_info or not file_info.file_name:
         original_name = f"new_file_{int(datetime.now().timestamp())}.mp4"
     else:
         original_name = file_info.file_name
 
-    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
     status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
     try:
-        start_time = datetime.now()
-        await m.download(file_name=str(tmp_path),
-                         progress=pyrogram_progress_wrapper,
-                         progress_args=(status_msg, start_time, "Downloading"))
+        await m.download(file_name=str(tmp_path))
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_path, original_name=original_name)
+        await process_file_and_upload(c, m, tmp_path, original_name=original_name, delete_after_upload=status_msg.id)
     except Exception as e:
         await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
     finally:
@@ -420,13 +380,12 @@ async def rename_cmd(c, m: Message):
 
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
-    tmp_out = TMP / f"rename_{uid}_{int(datetime.now().timestamp())}_{new_name}"
     status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+    tmp_out = TMP / f"rename_{uid}_{int(datetime.now().timestamp())}_{new_name}"
     try:
-        start_time = datetime.now()
-        await m.reply_to_message.download(file_name=str(tmp_out), progress=pyrogram_progress_wrapper, progress_args=(status_msg, start_time, "Downloading"))
+        await m.reply_to_message.download(file_name=str(tmp_out))
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_out, original_name=new_name)
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name, delete_after_upload=status_msg.id)
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
@@ -445,6 +404,11 @@ async def cancel_task_cb(c, cb):
             except:
                 pass
         await cb.answer("অপারেশন বাতিল করা হয়েছে।", show_alert=True)
+        # Delete the progress message
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
@@ -471,7 +435,7 @@ async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
 # *** নতুন: ভিডিও কনভার্সন ফাংশন ***
 async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
     try:
-        await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...")
+        await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
@@ -483,7 +447,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         
         if result.returncode != 0:
             logger.warning("Container conversion failed, attempting full re-encoding: %s", result.stderr)
-            await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...")
+            await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             cmd_full = [
                 "ffmpeg",
                 "-i", str(in_path),
@@ -506,23 +470,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         return False, str(e)
 
 
-async def upload_progress_async(current, total, message: Message, start_time):
-    await progress_callback(current, total, message, start_time, task="Uploading")
-
-def pyrogram_upload_wrapper(current, total, message_obj, start_time_obj):
-    try:
-        loop = asyncio.get_event_loop()
-        try:
-            asyncio.run_coroutine_threadsafe(upload_progress_async(current, total, message_obj, start_time_obj), loop)
-        except Exception:
-            try:
-                loop.create_task(upload_progress_async(current, total, message_obj, start_time_obj))
-            except Exception:
-                pass
-    except RuntimeError:
-        pass
-
-async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None):
+async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, delete_after_upload: int = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -531,13 +479,13 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     
     try:
         final_name = original_name or in_path.name
+        
         thumb_path = USER_THUMBS.get(uid)
         if thumb_path and not Path(thumb_path).exists():
             thumb_path = None
 
         is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
         
-        # *** নতুন লজিক: ভিডিও কনভার্সন ***
         if is_video and in_path.suffix.lower() != ".mp4":
             mp4_path = TMP / f"{in_path.stem}.mp4"
             status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MP4 এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
@@ -548,7 +496,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 upload_path = mp4_path
                 final_name = f"{Path(final_name).stem}.mp4"
                 
-        # *** থাম্বনেইল জেনারেশন ***
         if is_video and not thumb_path:
             thumb_path_tmp = TMP / f"thumb_{uid}_{int(datetime.now().timestamp())}.jpg"
             ok = await generate_video_thumbnail(upload_path, thumb_path_tmp)
@@ -560,8 +507,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             await status_msg.edit("অপারেশন বাতিল করা হয়েছে, আপলোড শুরু করা হয়নি।", reply_markup=None)
             TASKS[uid].remove(cancel_event)
             return
-        start_time = datetime.now()
-
+        
         duration_sec = get_video_duration(upload_path) if upload_path.exists() else 0
 
         upload_attempts = 3
@@ -575,8 +521,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         caption=final_name,
                         thumb=thumb_path,
                         duration=duration_sec,
-                        progress=pyrogram_upload_wrapper,
-                        progress_args=(status_msg, start_time),
                         supports_streaming=True
                     )
                 else:
@@ -584,10 +528,16 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         chat_id=m.chat.id,
                         document=str(upload_path),
                         file_name=final_name,
-                        caption=final_name,
-                        progress=pyrogram_upload_wrapper,
-                        progress_args=(status_msg, start_time)
+                        caption=final_name
                     )
+                
+                # --- নতুন লজিক: আপলোড সফল হলে মেসেজ ডিলিট করা ---
+                if delete_after_upload:
+                    try:
+                        await c.delete_messages(chat_id=m.chat.id, message_ids=delete_after_upload)
+                    except Exception:
+                        pass
+                
                 await status_msg.edit("আপলোড সম্পন্ন।", reply_markup=None)
                 LAST_FILE[uid] = {"path": str(upload_path), "name": final_name, "is_video": is_video, "thumb": thumb_path, "ts": datetime.now().isoformat()}
                 last_exc = None
@@ -617,6 +567,16 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             pass
 
 # *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
+@app.on_message(filters.command("broadcast") & filters.private)
+async def broadcast_cmd_no_reply(c, m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই।")
+        return
+    if not m.reply_to_message:
+        await m.reply_text("ব্রডকাস্ট করতে যেকোনো মেসেজে (ছবি, ভিডিও বা টেক্সট) রিপ্লাই করে এই কমান্ড দিন।")
+        return
+
 @app.on_message(filters.command("broadcast") & filters.private & filters.reply)
 async def broadcast_cmd_reply(c, m: Message):
     uid = m.from_user.id
