@@ -17,6 +17,7 @@ from flask import Flask
 import time
 import math
 import logging
+import requests  # Pinging service-এর জন্য requests লাইব্রেরি import করা হলো
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,11 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
+MAX_SIZE = 2 * 1024 * 1024 * 1024
+
+# Pinging service-এর জন্য আপনার Render URL এখানে দিন
+RENDER_URL = os.getenv("RENDER_URL", "https://bot-3ehc.onrender.com")
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
@@ -36,9 +42,6 @@ LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-
-ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-MAX_SIZE = 2 * 1024 * 1024 * 1024
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
@@ -79,14 +82,12 @@ def get_video_duration(file_path: Path) -> int:
 def progress_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_task")]])
 
-# ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
     pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
     pass
 
-# ---- robust download stream with retries ----
 async def download_stream(resp, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     total = 0
     try:
@@ -452,7 +453,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
                 "-c:a", "copy",
                 str(out_path)
             ]
-            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=false, timeout=3600)
+            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=False, timeout=3600)
             if result_full.returncode != 0:
                 raise Exception(f"Full re-encoding failed: {result_full.stderr}")
 
@@ -531,7 +532,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         caption=final_name
                     )
                 
-                # --- নতুন লজিক: সব মেসেজ ডিলিট করা ---
                 if messages_to_delete:
                     try:
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
@@ -568,7 +568,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         except Exception:
             pass
 
-# *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd_no_reply(c, m: Message):
     uid = m.from_user.id
@@ -607,11 +606,22 @@ async def broadcast_cmd_reply(c, m: Message):
 
     await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
 
-
 # Flask route to keep web service port open for Render
 @flask_app.route("/")
 def home():
     return "Bot is running (Flask alive)."
+
+# নতুন পিঙ্গিং ফাংশন
+def keep_alive():
+    while True:
+        try:
+            # Render URL-এ একটি GET রিকোয়েস্ট পাঠানো হচ্ছে
+            response = requests.get(RENDER_URL)
+            logger.info(f"Pinged {RENDER_URL}, status: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Ping failed: {e}")
+        # প্রতি 10 মিনিটে একবার পিং করা হবে
+        time.sleep(600)
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT)
@@ -635,6 +645,11 @@ if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
+    
+    # পিং সার্ভিস চালানোর জন্য আরেকটি থ্রেড
+    ping_thread = threading.Thread(target=keep_alive, daemon=True)
+    ping_thread.start()
+
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(periodic_cleanup())
