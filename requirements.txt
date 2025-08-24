@@ -23,5 +23,6 @@ yt-dlp
 lk21
 pytube
 flask
+python-dotenv
 gunicorn==20.1.0
 python-telegram-bot==20.7
