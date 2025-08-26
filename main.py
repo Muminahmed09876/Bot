@@ -39,7 +39,7 @@ SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
 USER_CAPTION_TEMPLATES = {}
 USER_COUNTERS = {}
-USER_SETTING_CAPTION = set()  # New: To track users in caption setting mode
+USER_SETTING_CAPTION = set()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 2 * 1024 * 1024 * 2048
@@ -47,30 +47,31 @@ MAX_SIZE = 2 * 1024 * 1024 * 2048
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
 
-# ---- New: Data persistence functions ----
-CAPTION_DATA_FILE = "caption_data.json"
-
+# ---- Updated: Data persistence functions using user-specific files ----
 def load_caption_data():
     global USER_CAPTION_TEMPLATES, USER_COUNTERS
-    if os.path.exists(CAPTION_DATA_FILE):
+    caption_files = TMP.glob("caption_*.json")
+    for file_path in caption_files:
         try:
-            with open(CAPTION_DATA_FILE, "r") as f:
+            uid = int(file_path.stem.split("_")[1])
+            with open(file_path, "r") as f:
                 data = json.load(f)
-                USER_CAPTION_TEMPLATES = {int(k): v for k, v in data.get("templates", {}).items()}
-                USER_COUNTERS = {int(k): v for k, v in data.get("counters", {}).items()}
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error("Failed to load caption data: %s", e)
+                USER_CAPTION_TEMPLATES[uid] = data.get("template")
+                USER_COUNTERS[uid] = data.get("counters")
+        except (IOError, json.JSONDecodeError, IndexError, ValueError) as e:
+            logger.error("Failed to load caption data from %s: %s", file_path, e)
 
-def save_caption_data():
+def save_caption_data(uid):
+    file_path = TMP / f"caption_{uid}.json"
     try:
-        with open(CAPTION_DATA_FILE, "w") as f:
-            json.dump({
-                "templates": USER_CAPTION_TEMPLATES,
-                "counters": USER_COUNTERS
-            }, f)
+        data = {
+            "template": USER_CAPTION_TEMPLATES.get(uid),
+            "counters": USER_COUNTERS.get(uid)
+        }
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)
     except IOError as e:
-        logger.error("Failed to save caption data: %s", e)
-
+        logger.error("Failed to save caption data for user %s: %s", uid, e)
 
 # ---- utilities ----
 def is_admin(uid: int) -> bool:
@@ -108,14 +109,12 @@ def get_video_duration(file_path: Path) -> int:
 def progress_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_task")]])
 
-# ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
     pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
     pass
 
-# ---- robust download stream with retries ----
 async def download_stream(resp, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     total = 0
     try:
@@ -214,7 +213,6 @@ async def set_bot_commands():
     except Exception as e:
         logger.warning("Set commands error: %s", e)
 
-# ---- New: Dynamic caption generation utility ----
 def generate_dynamic_caption(uid, original_caption):
     if uid not in USER_CAPTION_TEMPLATES:
         return original_caption
@@ -224,13 +222,11 @@ def generate_dynamic_caption(uid, original_caption):
     
     final_caption = template
     
-    # Process the {+1} logic
     re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
     match_plus1 = re_plus1.search(final_caption)
     if match_plus1:
         up_count = int(match_plus1.group(1))
         
-        # Check if the counter needs to be incremented based on the up_count
         if counters["+1"] % up_count == 0:
             if "last_episode" not in counters:
                 counters["last_episode"] = 1
@@ -240,7 +236,6 @@ def generate_dynamic_caption(uid, original_caption):
         episode_number = counters.get("last_episode", 1)
         final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
         
-    # Process the {repite} logic
     re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
     match_repite = re_repite.search(final_caption)
     if match_repite:
@@ -249,11 +244,9 @@ def generate_dynamic_caption(uid, original_caption):
         index = counters["repite"]
         final_caption = final_caption.replace(match_repite.group(0), options[index])
     
-    # After all replacements, increment the main counter for the next video
     counters["+1"] += 1 
     
-    # Save the updated counters to the file
-    save_caption_data()
+    save_caption_data(uid)
     
     return final_caption
 
@@ -496,7 +489,7 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
-# ---- New Caption Handlers ----
+# ---- Updated Caption Handlers ----
 @app.on_message(filters.command("set_caption_template") & filters.private)
 async def set_caption_prompt_start(c, m: Message):
     if not is_admin(m.from_user.id):
@@ -505,7 +498,6 @@ async def set_caption_prompt_start(c, m: Message):
         
     uid = m.from_user.id
     
-    # Store the user ID to know who to wait for a caption from
     USER_SETTING_CAPTION.add(uid)
     
     example_text = (
@@ -525,21 +517,18 @@ async def set_caption_prompt_start(c, m: Message):
 async def handle_caption_template_text(c, m: Message):
     uid = m.from_user.id
     
-    # Check if this user is in the caption setting state
     if uid not in USER_SETTING_CAPTION:
         return
     
-    # The reply must be to a message from the bot
     if not m.reply_to_message or m.reply_to_message.from_user.id != c.me.id:
         return
 
-    # Remove user from the state
     USER_SETTING_CAPTION.discard(uid)
     
     template = m.text.strip()
     USER_CAPTION_TEMPLATES[uid] = template
     USER_COUNTERS[uid] = {"+1": 0, "repite": -1}
-    save_caption_data()
+    save_caption_data(uid)
     
     await m.reply_text("ক্যাপশন টেমপ্লেট সফলভাবে সেভ হয়েছে।", quote=True)
 
@@ -550,10 +539,19 @@ async def clear_caption_template_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
         
-    USER_CAPTION_TEMPLATES.pop(m.from_user.id, None)
-    USER_COUNTERS.pop(m.from_user.id, None)
-    save_caption_data()
-    await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
+    uid = m.from_user.id
+    caption_file = TMP / f"caption_{uid}.json"
+    
+    if caption_file.exists():
+        try:
+            caption_file.unlink()
+        except Exception:
+            pass
+        USER_CAPTION_TEMPLATES.pop(uid, None)
+        USER_COUNTERS.pop(uid, None)
+        await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
+    else:
+        await m.reply_text("আপনার কোনো ক্যাপশন টেমপ্লেট সেভ করা নেই।")
 
 @app.on_message(filters.command("view_caption") & filters.private)
 async def view_caption_cmd(c, m: Message):
@@ -638,7 +636,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     try:
         final_name = original_name or in_path.name
         
-        # Check if a specific caption text was provided
         if caption_text:
             final_caption = caption_text
         else:
@@ -735,7 +732,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         except Exception:
             pass
 
-# *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd_no_reply(c, m: Message):
     uid = m.from_user.id
@@ -774,7 +770,6 @@ async def broadcast_cmd_reply(c, m: Message):
 
     await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
 
-
 # Flask route to keep web service port open for Render
 @flask_app.route("/")
 def home():
@@ -800,7 +795,7 @@ async def periodic_cleanup():
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    load_caption_data() # Load data on startup
+    load_caption_data()
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     try:
