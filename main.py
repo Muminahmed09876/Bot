@@ -141,7 +141,7 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.2Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
