@@ -18,6 +18,8 @@ import time
 import math
 import logging
 import json
+from pymongo import MongoClient
+import certifi
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +29,10 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
+
+# MongoDB Configuration
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME", "TA_HD_File_Share")
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
@@ -47,31 +53,105 @@ MAX_SIZE = 2 * 1024 * 1024 * 2048
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
 
-# ---- Updated: Data persistence functions using user-specific files ----
-def load_caption_data():
-    global USER_CAPTION_TEMPLATES, USER_COUNTERS
-    caption_files = TMP.glob("caption_*.json")
-    for file_path in caption_files:
-        try:
-            uid = int(file_path.stem.split("_")[1])
-            with open(file_path, "r") as f:
-                data = json.load(f)
-                USER_CAPTION_TEMPLATES[uid] = data.get("template")
-                USER_COUNTERS[uid] = data.get("counters")
-        except (IOError, json.JSONDecodeError, IndexError, ValueError) as e:
-            logger.error("Failed to load caption data from %s: %s", file_path, e)
+# --- Database Connection and Functions ---
+def connect_db():
+    try:
+        if MONGO_URI:
+            client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+            db = client[DB_NAME]
+            logger.info("Successfully connected to MongoDB!")
+            return db
+        else:
+            logger.warning("MONGO_URI not set. Running without a database.")
+            return None
+    except Exception as e:
+        logger.error("Failed to connect to MongoDB: %s", e)
+        return None
+
+db_client = connect_db()
+
+def load_data_from_db():
+    global USER_CAPTION_TEMPLATES, USER_COUNTERS, USER_THUMBS, SUBSCRIBERS
+    if not db_client:
+        return
+
+    try:
+        # Load caption data
+        caption_collection = db_client["caption_data"]
+        for doc in caption_collection.find({}):
+            uid = doc.get("user_id")
+            if uid:
+                USER_CAPTION_TEMPLATES[uid] = doc.get("template")
+                USER_COUNTERS[uid] = doc.get("counters")
+
+        # Load thumb data
+        thumb_collection = db_client["thumb_data"]
+        for doc in thumb_collection.find({}):
+            uid = doc.get("user_id")
+            if uid:
+                USER_THUMBS[uid] = doc.get("thumb_path")
+
+        # Load subscribers
+        sub_collection = db_client["subscribers"]
+        for doc in sub_collection.find({}):
+            SUBSCRIBERS.add(doc.get("chat_id"))
+
+        logger.info("Data loaded from MongoDB successfully.")
+    except Exception as e:
+        logger.error("Failed to load data from MongoDB: %s", e)
 
 def save_caption_data(uid):
-    file_path = TMP / f"caption_{uid}.json"
+    if not db_client:
+        return
     try:
+        collection = db_client["caption_data"]
         data = {
             "template": USER_CAPTION_TEMPLATES.get(uid),
-            "counters": USER_COUNTERS.get(uid)
+            "counters": USER_COUNTERS.get(uid),
+            "user_id": uid
         }
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=4)
-    except IOError as e:
-        logger.error("Failed to save caption data for user %s: %s", uid, e)
+        collection.update_one({"user_id": uid}, {"$set": data}, upsert=True)
+    except Exception as e:
+        logger.error("Failed to save caption data to MongoDB for user %s: %s", uid, e)
+
+def save_thumb_path(uid, thumb_path):
+    if not db_client:
+        return
+    try:
+        collection = db_client["thumb_data"]
+        data = {"user_id": uid, "thumb_path": thumb_path}
+        collection.update_one({"user_id": uid}, {"$set": data}, upsert=True)
+    except Exception as e:
+        logger.error("Failed to save thumb path to MongoDB for user %s: %s", uid, e)
+
+def delete_thumb_path(uid):
+    if not db_client:
+        return
+    try:
+        collection = db_client["thumb_data"]
+        collection.delete_one({"user_id": uid})
+    except Exception as e:
+        logger.error("Failed to delete thumb path from MongoDB for user %s: %s", uid, e)
+
+def add_subscriber(chat_id):
+    if not db_client:
+        return
+    try:
+        collection = db_client["subscribers"]
+        collection.update_one({"chat_id": chat_id}, {"$set": {"chat_id": chat_id}}, upsert=True)
+    except Exception as e:
+        logger.error("Failed to add subscriber to MongoDB: %s", e)
+
+def get_all_subscribers():
+    if not db_client:
+        return []
+    try:
+        collection = db_client["subscribers"]
+        return [doc.get("chat_id") for doc in collection.find({}) if doc.get("chat_id")]
+    except Exception as e:
+        logger.error("Failed to get subscribers from MongoDB: %s", e)
+        return []
+# --- End of Database Functions ---
 
 # ---- utilities ----
 def is_admin(uid: int) -> bool:
@@ -131,7 +211,7 @@ async def download_stream(resp, out_path: Path, message: Message = None, cancel_
                     break
                 total += len(chunk)
                 if total > MAX_SIZE:
-                    return False, "ফাইলের সাইজ 2GB এর বেশি হতে পারে না।"
+                    return False, "ফাইলের সাইজ 2GB এর বেশি হতে না।"
                 f.write(chunk)
     except Exception as e:
         return False, str(e)
@@ -255,6 +335,7 @@ def generate_dynamic_caption(uid, original_caption):
 async def start_handler(c, m: Message):
     await set_bot_commands()
     SUBSCRIBERS.add(m.chat.id)
+    add_subscriber(m.chat.id)
     text = (
         "Hi! আমি URL uploader bot.\n\n"
         "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
@@ -309,6 +390,7 @@ async def del_thumb_cmd(c, m: Message):
         except Exception:
             pass
         USER_THUMBS.pop(uid, None)
+        delete_thumb_path(uid)
         await m.reply_text("আপনার থাম্বনেইল মুছে ফেলা হয়েছে।")
     else:
         await m.reply_text("আপনার কোনো থাম্বনেইল সেভ করা নেই।")
@@ -326,6 +408,7 @@ async def photo_handler(c, m: Message):
         img = img.convert("RGB")
         img.save(out, "JPEG")
         USER_THUMBS[uid] = str(out)
+        save_thumb_path(uid, str(out))
         if uid in SET_THUMB_REQUEST:
             SET_THUMB_REQUEST.discard(uid)
             await m.reply_text("আপনার থাম্বনেইল সেভ হয়েছে।")
@@ -540,15 +623,16 @@ async def clear_caption_template_cmd(c, m: Message):
         return
         
     uid = m.from_user.id
-    caption_file = TMP / f"caption_{uid}.json"
     
-    if caption_file.exists():
-        try:
-            caption_file.unlink()
-        except Exception:
-            pass
+    if uid in USER_CAPTION_TEMPLATES:
         USER_CAPTION_TEMPLATES.pop(uid, None)
         USER_COUNTERS.pop(uid, None)
+        if db_client:
+            try:
+                collection = db_client["caption_data"]
+                collection.delete_one({"user_id": uid})
+            except Exception as e:
+                logger.error("Failed to delete caption data from MongoDB for user %s: %s", uid, e)
         await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
     else:
         await m.reply_text("আপনার কোনো ক্যাপশন টেমপ্লেট সেভ করা নেই।")
@@ -754,10 +838,11 @@ async def broadcast_cmd_reply(c, m: Message):
         await m.reply_text("ব্রডকাস্ট করার জন্য একটি মেসেজে রিপ্লাই করে এই কমান্ড দিন।")
         return
 
-    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...", quote=True)
+    subscribers = get_all_subscribers()
+    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(subscribers)} সাবস্ক্রাইবারে...", quote=True)
     failed = 0
     sent = 0
-    for chat_id in list(SUBSCRIBERS):
+    for chat_id in subscribers:
         if chat_id == m.chat.id:
             continue
         try:
@@ -795,7 +880,7 @@ async def periodic_cleanup():
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    load_caption_data()
+    load_data_from_db()
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     try:
