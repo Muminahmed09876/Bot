@@ -142,8 +142,7 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.
-Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -758,13 +757,15 @@ async def periodic_cleanup():
             pass
         await asyncio.sleep(3600)
 
-if __name__ == "__main__":
+async def main():
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
+    await periodic_cleanup()
+    await app.run()
+
+if __name__ == "__main__":
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(periodic_cleanup())
-    except RuntimeError:
-        pass
-    app.run()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("বট বন্ধ হচ্ছে...")
