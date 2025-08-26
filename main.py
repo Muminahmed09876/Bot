@@ -17,9 +17,6 @@ from flask import Flask
 import time
 import math
 import logging
-import json
-from pymongo import MongoClient
-import certifi
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,10 +27,6 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
 
-# MongoDB Configuration
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "TA_HD_File_Share")
-
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
 
@@ -43,115 +36,15 @@ LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-USER_CAPTION_TEMPLATES = {}
-USER_COUNTERS = {}
-USER_SETTING_CAPTION = set()
+# New state for captions
+SET_CAPTION_REQUEST = set()
+USER_CAPTIONS = {}
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-MAX_SIZE = 2 * 1024 * 1024 * 2048
+MAX_SIZE = 2 * 1024 * 1024 * 1024
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
-
-# --- Database Connection and Functions ---
-def connect_db():
-    try:
-        if MONGO_URI:
-            client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-            db = client[DB_NAME]
-            logger.info("Successfully connected to MongoDB!")
-            return db
-        else:
-            logger.warning("MONGO_URI not set. Running without a database.")
-            return None
-    except Exception as e:
-        logger.error("Failed to connect to MongoDB: %s", e)
-        return None
-
-db_client = connect_db()
-
-def load_data_from_db():
-    global USER_CAPTION_TEMPLATES, USER_COUNTERS, USER_THUMBS, SUBSCRIBERS
-    if db_client is None:
-        return
-
-    try:
-        # Load caption data
-        caption_collection = db_client["caption_data"]
-        for doc in caption_collection.find({}):
-            uid = doc.get("user_id")
-            if uid:
-                USER_CAPTION_TEMPLATES[uid] = doc.get("template")
-                USER_COUNTERS[uid] = doc.get("counters")
-
-        # Load thumb data
-        thumb_collection = db_client["thumb_data"]
-        for doc in thumb_collection.find({}):
-            uid = doc.get("user_id")
-            if uid:
-                USER_THUMBS[uid] = doc.get("thumb_path")
-
-        # Load subscribers
-        sub_collection = db_client["subscribers"]
-        for doc in sub_collection.find({}):
-            SUBSCRIBERS.add(doc.get("chat_id"))
-
-        logger.info("Data loaded from MongoDB successfully.")
-    except Exception as e:
-        logger.error("Failed to load data from MongoDB: %s", e)
-
-def save_caption_data(uid):
-    if db_client is None:
-        return
-    try:
-        collection = db_client["caption_data"]
-        data = {
-            "template": USER_CAPTION_TEMPLATES.get(uid),
-            "counters": USER_COUNTERS.get(uid),
-            "user_id": uid
-        }
-        collection.update_one({"user_id": uid}, {"$set": data}, upsert=True)
-    except Exception as e:
-        logger.error("Failed to save caption data to MongoDB for user %s: %s", uid, e)
-
-def save_thumb_path(uid, thumb_path):
-    if db_client is None:
-        return
-    try:
-        collection = db_client["thumb_data"]
-        data = {"user_id": uid, "thumb_path": thumb_path}
-        collection.update_one({"user_id": uid}, {"$set": data}, upsert=True)
-    except Exception as e:
-        logger.error("Failed to save thumb path to MongoDB for user %s: %s", uid, e)
-
-def delete_thumb_path(uid):
-    if db_client is None:
-        return
-    try:
-        collection = db_client["thumb_data"]
-        collection.delete_one({"user_id": uid})
-    except Exception as e:
-        logger.error("Failed to delete thumb path from MongoDB for user %s: %s", uid, e)
-
-def add_subscriber(chat_id):
-    if db_client is None:
-        return
-    try:
-        collection = db_client["subscribers"]
-        collection.update_one({"chat_id": chat_id}, {"$set": {"chat_id": chat_id}}, upsert=True)
-    except Exception as e:
-        logger.error("Failed to add subscriber to MongoDB: %s", e)
-
-def get_all_subscribers():
-    if db_client is None:
-        return []
-    try:
-        collection = db_client["subscribers"]
-        return [doc.get("chat_id") for doc in collection.find({}) if doc.get("chat_id")]
-    except Exception as e:
-        logger.error("Failed to get subscribers from MongoDB: %s", e)
-        return []
-# --- End of Database Functions ---
 
 # ---- utilities ----
 def is_admin(uid: int) -> bool:
@@ -189,12 +82,17 @@ def get_video_duration(file_path: Path) -> int:
 def progress_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_task")]])
 
+def delete_caption_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
+
+# ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
     pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
     pass
 
+# ---- robust download stream with retries ----
 async def download_stream(resp, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     total = 0
     try:
@@ -211,7 +109,7 @@ async def download_stream(resp, out_path: Path, message: Message = None, cancel_
                     break
                 total += len(chunk)
                 if total > MAX_SIZE:
-                    return False, "ফাইলের সাইজ 2GB এর বেশি হতে না।"
+                    return False, "ফাইলের সাইজ 2GB এর বেশি হতে পারে না।"
                 f.write(chunk)
     except Exception as e:
         return False, str(e)
@@ -281,10 +179,9 @@ async def set_bot_commands():
         BotCommand("setthumb", "কাস্টম থাম্বনেইল সেট করুন (admin only)"),
         BotCommand("view_thumb", "আপনার থাম্বনেইল দেখুন (admin only)"),
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
+        BotCommand("set_caption", "কাস্টম ক্যাপশন সেট করুন (admin only)"),
+        BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
-        BotCommand("set_caption_template", "ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)"),
-        BotCommand("view_caption", "বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)"),
-        BotCommand("clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -293,62 +190,23 @@ async def set_bot_commands():
     except Exception as e:
         logger.warning("Set commands error: %s", e)
 
-def generate_dynamic_caption(uid, original_caption):
-    if uid not in USER_CAPTION_TEMPLATES:
-        return original_caption
-
-    template = USER_CAPTION_TEMPLATES[uid]
-    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
-    
-    final_caption = template
-    
-    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
-    match_plus1 = re_plus1.search(final_caption)
-    if match_plus1:
-        up_count = int(match_plus1.group(1))
-        
-        if counters["+1"] % up_count == 0:
-            if "last_episode" not in counters:
-                counters["last_episode"] = 1
-            else:
-                counters["last_episode"] += 1
-        
-        episode_number = counters.get("last_episode", 1)
-        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
-        
-    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
-    match_repite = re_repite.search(final_caption)
-    if match_repite:
-        options = [opt.strip() for opt in match_repite.group(1).split(',')]
-        counters["repite"] = (counters["repite"] + 1) % len(options)
-        index = counters["repite"]
-        final_caption = final_caption.replace(match_repite.group(0), options[index])
-    
-    counters["+1"] += 1 
-    
-    save_caption_data(uid)
-    
-    return final_caption
-
 # ---- handlers ----
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(c, m: Message):
     await set_bot_commands()
     SUBSCRIBERS.add(m.chat.id)
-    add_subscriber(m.chat.id)
     text = (
         "Hi! আমি URL uploader bot.\n\n"
         "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
         "Commands:\n"
-        "/upload_url <url> - URL থেকে ফাইল ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
+        "/upload_url <url> - URL থেকে ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
         "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
         "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
+        "/set_caption - একটি ক্যাপশন সেট করুন (admin only)\n"
+        "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
-        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
-        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
-        "/clear_caption_template - ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)\n"
-        "/broadcast <text> - ব্রডকাস্ট (কেবল অ্যাডমিন)\n"
+        "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
     await m.reply_text(text)
@@ -390,7 +248,6 @@ async def del_thumb_cmd(c, m: Message):
         except Exception:
             pass
         USER_THUMBS.pop(uid, None)
-        delete_thumb_path(uid)
         await m.reply_text("আপনার থাম্বনেইল মুছে ফেলা হয়েছে।")
     else:
         await m.reply_text("আপনার কোনো থাম্বনেইল সেভ করা নেই।")
@@ -400,49 +257,86 @@ async def photo_handler(c, m: Message):
     if not is_admin(m.from_user.id):
         return
     uid = m.from_user.id
-    out = TMP / f"thumb_{uid}.jpg"
-    try:
-        await m.download(file_name=str(out))
-        img = Image.open(out)
-        img.thumbnail((320, 320))
-        img = img.convert("RGB")
-        img.save(out, "JPEG")
-        USER_THUMBS[uid] = str(out)
-        save_thumb_path(uid, str(out))
-        if uid in SET_THUMB_REQUEST:
-            SET_THUMB_REQUEST.discard(uid)
+    if uid in SET_THUMB_REQUEST:
+        SET_THUMB_REQUEST.discard(uid)
+        out = TMP / f"thumb_{uid}.jpg"
+        try:
+            await m.download(file_name=str(out))
+            img = Image.open(out)
+            img.thumbnail((320, 320))
+            img = img.convert("RGB")
+            img.save(out, "JPEG")
+            USER_THUMBS[uid] = str(out)
             await m.reply_text("আপনার থাম্বনেইল সেভ হয়েছে।")
-        else:
-            await m.reply_text("অটো থাম্বনেইল সেভ হয়েছে।")
-    except Exception as e:
-        await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
+        except Exception as e:
+            await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
+    else:
+        # If not a thumb request, do nothing or handle as a regular photo
+        pass
 
+# New handlers for caption
+@app.on_message(filters.command("set_caption") & filters.private)
+async def set_caption_prompt(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+    SET_CAPTION_REQUEST.add(m.from_user.id)
+    await m.reply_text("ক্যাপশন দিন।")
+
+@app.on_message(filters.command("view_caption") & filters.private)
+async def view_caption_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+    uid = m.from_user.id
+    caption = USER_CAPTIONS.get(uid)
+    if caption:
+        await m.reply_text(f"আপনার সেভ করা ক্যাপশন:\n\n**{caption}**", reply_markup=delete_caption_keyboard())
+    else:
+        await m.reply_text("আপনার কোনো ক্যাপশন সেভ করা নেই। /set_caption দিয়ে সেট করুন।")
+
+@app.on_callback_query(filters.regex("delete_caption"))
+async def delete_caption_cb(c, cb):
+    uid = cb.from_user.id
+    if not is_admin(uid):
+        await cb.answer("আপনার অনুমতি নেই।", show_alert=True)
+        return
+    if uid in USER_CAPTIONS:
+        USER_CAPTIONS.pop(uid)
+        await cb.message.edit_text("আপনার ক্যাপশন মুছে ফেলা হয়েছে।")
+    else:
+        await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
+
+@app.on_message(filters.text & filters.private)
+async def text_handler(c, m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    uid = m.from_user.id
+    text = m.text.strip()
+    
+    # Handle set caption request
+    if uid in SET_CAPTION_REQUEST:
+        SET_CAPTION_REQUEST.discard(uid)
+        USER_CAPTIONS[uid] = text
+        await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
+        return
+
+    # Handle auto URL upload
+    if text.startswith("http://") or text.startswith("https://"):
+        asyncio.create_task(handle_url_download_and_upload(c, m, text))
+    
 @app.on_message(filters.command("upload_url") & filters.private)
 async def upload_url_cmd(c, m: Message):
     if not is_admin(m.from_user.id):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     if not m.command or len(m.command) < 2:
-        await m.reply_text("ব্যবহার: /upload_url <url> [ক্যাপশন]\nউদাহরণ: /upload_url https://example.com/file.mp4 নতুন ভিডিও ক্যাপশন")
+        await m.reply_text("ব্যবহার: /upload_url <url>\nউদাহরণ: /upload_url https://example.com/file.mp4")
         return
-    
-    parts = m.text.split(None, 2)
-    url = parts[1].strip()
-    caption = parts[2] if len(parts) > 2 else None
-    
-    asyncio.create_task(handle_url_download_and_upload(c, m, url, caption_text=caption))
+    url = m.text.split(None, 1)[1].strip()
+    asyncio.create_task(handle_url_download_and_upload(c, m, url))
 
-@app.on_message(filters.text & filters.private)
-async def auto_url_upload(c, m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    text = m.text.strip()
-    if text.startswith("http://") or text.startswith("https://"):
-        url = text.split(" ")[0]
-        caption = text.split(" ", 1)[1] if len(text.split(" ")) > 1 else None
-        asyncio.create_task(handle_url_download_and_upload(c, m, url, caption_text=caption))
-
-async def handle_url_download_and_upload(c: Client, m: Message, url: str, caption_text: str = None):
+async def handle_url_download_and_upload(c: Client, m: Message, url: str):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -480,7 +374,7 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str, captio
             return
 
         await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id], caption_text=caption_text)
+        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         traceback.print_exc()
         await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
@@ -526,16 +420,12 @@ async def rename_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই।")
         return
     if not m.reply_to_message or not (m.reply_to_message.video or m.reply_to_message.document):
-        await m.reply_text("ভিডিও/ডকুমেন্ট ফাইলের reply দিয়ে এই কমান্ড দিন।\nUsage: /rename <new_name.ext> [ক্যাপশন]")
+        await m.reply_text("ভিডিও/ডকুমেন্ট ফাইলের reply দিয়ে এই কমান্ড দিন।\nUsage: /rename new_name.mp4")
         return
     if len(m.command) < 2:
         await m.reply_text("নতুন ফাইল নাম দিন। উদাহরণ: /rename new_video.mp4")
         return
-    
-    parts = m.text.split(None, 2)
-    new_name = parts[1].strip()
-    caption = parts[2] if len(parts) > 2 else None
-    
+    new_name = m.text.split(None, 1)[1].strip()
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
     await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
 
@@ -546,7 +436,7 @@ async def rename_cmd(c, m: Message):
     try:
         await m.reply_to_message.download(file_name=str(tmp_out))
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id], caption_text=caption)
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
@@ -571,85 +461,6 @@ async def cancel_task_cb(c, cb):
             pass
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
-
-# ---- Updated Caption Handlers ----
-@app.on_message(filters.command("set_caption_template") & filters.private)
-async def set_caption_prompt_start(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
-        return
-        
-    uid = m.from_user.id
-    
-    USER_SETTING_CAPTION.add(uid)
-    
-    example_text = (
-        "ক্যাপশন টেমপ্লেট টেক্সট দিন।\n"
-        "এই টেমপ্লেট ব্যবহার করে আপনি ডাইনামিক ক্যাপশন তৈরি করতে পারেন:\n\n"
-        "**উদাহরণ ১:** `{+1 (3 up)}`\n"
-        "এটি প্রতি ৩টি আপলোডের পর একটি করে সংখ্যা বাড়াবে।\n\n"
-        "**উদাহরণ ২:** `{repite (480p), (720p)}`\n"
-        "এটি পর্যায়ক্রমে ৪টি ভিডিওর জন্য `(480p)`, `(720p)`, `(480p)`, `(720p)` এভাবে ব্যবহার হবে।\n\n"
-        "**উদাহরণ ৩:**\n"
-        "`**Season - 01**, **Episode - {+1 (1 up)}**, **Quality - {repite (480p), (720p)}**`"
-    )
-    
-    await m.reply_text(example_text, quote=True)
-
-@app.on_message(filters.private & filters.text & filters.reply)
-async def handle_caption_template_text(c, m: Message):
-    uid = m.from_user.id
-    
-    if uid not in USER_SETTING_CAPTION:
-        return
-    
-    if not m.reply_to_message or m.reply_to_message.from_user.id != c.me.id:
-        return
-
-    USER_SETTING_CAPTION.discard(uid)
-    
-    template = m.text.strip()
-    USER_CAPTION_TEMPLATES[uid] = template
-    USER_COUNTERS[uid] = {"+1": 0, "repite": -1}
-    save_caption_data(uid)
-    
-    await m.reply_text("ক্যাপশন টেমপ্লেট সফলভাবে সেভ হয়েছে।", quote=True)
-
-
-@app.on_message(filters.command("clear_caption_template") & filters.private)
-async def clear_caption_template_cmd(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
-        return
-        
-    uid = m.from_user.id
-    
-    if uid in USER_CAPTION_TEMPLATES:
-        USER_CAPTION_TEMPLATES.pop(uid, None)
-        USER_COUNTERS.pop(uid, None)
-        if db_client is not None:
-            try:
-                collection = db_client["caption_data"]
-                collection.delete_one({"user_id": uid})
-            except Exception as e:
-                logger.error("Failed to delete caption data from MongoDB for user %s: %s", uid, e)
-        await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
-    else:
-        await m.reply_text("আপনার কোনো ক্যাপশন টেমপ্লেট সেভ করা নেই।")
-
-@app.on_message(filters.command("view_caption") & filters.private)
-async def view_caption_cmd(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
-        return
-    
-    uid = m.from_user.id
-    if uid in USER_CAPTION_TEMPLATES:
-        template = USER_CAPTION_TEMPLATES[uid]
-        await m.reply_text(f"আপনার বর্তমান সেভ করা ক্যাপশন টেমপ্লেটটি হলো:\n\n`{template}`")
-    else:
-        await m.reply_text("আপনার কোনো ক্যাপশন টেমপ্লেট সেভ করা নেই। `/set_caption_template` দিয়ে একটি টেমপ্লেট সেভ করুন।")
-
 
 # ---- main processing and upload ----
 async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
@@ -708,7 +519,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         return False, str(e)
 
 
-async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None, caption_text: str = None):
+async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -716,15 +527,13 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     upload_path = in_path
     
     temp_thumb_path = None
+    
+    final_caption = None
+    if uid in USER_CAPTIONS:
+        final_caption = f"**{USER_CAPTIONS[uid]}**"
 
     try:
         final_name = original_name or in_path.name
-        
-        if caption_text:
-            final_caption = caption_text
-        else:
-            caption_template = USER_CAPTION_TEMPLATES.get(uid, f"**{final_name}**")
-            final_caption = generate_dynamic_caption(uid, caption_template)
         
         thumb_path = USER_THUMBS.get(uid)
 
@@ -758,6 +567,12 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             return
         
         duration_sec = get_video_duration(upload_path) if upload_path.exists() else 0
+        
+        # Determine the final caption
+        caption_to_use = final_name
+        if final_caption:
+            caption_to_use = f"{final_name}\n\n{final_caption}"
+
 
         upload_attempts = 3
         last_exc = None
@@ -767,7 +582,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                     await c.send_video(
                         chat_id=m.chat.id,
                         video=str(upload_path),
-                        caption=final_caption,
+                        caption=caption_to_use,
                         thumb=thumb_path,
                         duration=duration_sec,
                         supports_streaming=True
@@ -777,9 +592,10 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         chat_id=m.chat.id,
                         document=str(upload_path),
                         file_name=final_name,
-                        caption=final_caption
+                        caption=caption_to_use
                     )
                 
+                # --- নতুন লজিক: সব মেসেজ ডিলিট করা ---
                 if messages_to_delete:
                     try:
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
@@ -816,6 +632,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         except Exception:
             pass
 
+# *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd_no_reply(c, m: Message):
     uid = m.from_user.id
@@ -838,11 +655,10 @@ async def broadcast_cmd_reply(c, m: Message):
         await m.reply_text("ব্রডকাস্ট করার জন্য একটি মেসেজে রিপ্লাই করে এই কমান্ড দিন।")
         return
 
-    subscribers = get_all_subscribers()
-    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(subscribers)} সাবস্ক্রাইবারে...", quote=True)
+    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...", quote=True)
     failed = 0
     sent = 0
-    for chat_id in subscribers:
+    for chat_id in list(SUBSCRIBERS):
         if chat_id == m.chat.id:
             continue
         try:
@@ -854,6 +670,7 @@ async def broadcast_cmd_reply(c, m: Message):
             logger.warning("Broadcast to %s failed: %s", chat_id, e)
 
     await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
+
 
 # Flask route to keep web service port open for Render
 @flask_app.route("/")
@@ -880,7 +697,6 @@ async def periodic_cleanup():
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    load_data_from_db()
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     try:
