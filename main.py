@@ -176,12 +176,12 @@ async def set_bot_commands():
         BotCommand("view_thumb", "আপনার থাম্বনেইল দেখুন (admin only)"),
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
-        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
-        BotCommand("add_caption", "ক্যাপশন যোগ করুন (admin only)"),
-        BotCommand("delete_caption", "ক্যাপশন মুছে ফেলুন (admin only)"),
+        BotCommand("add_caption", "রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)"),
+        BotCommand("delete_caption", "রিপ্লাই করা মেসেজের ক্যাপশন মুছে ফেলুন (admin only)"),
         BotCommand("set_caption_template", "ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)"),
         BotCommand("view_caption", "বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)"),
         BotCommand("clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
     try:
@@ -243,7 +243,7 @@ async def start_handler(c, m: Message):
         "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
-        "/add_caption <text> - রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)\n"
+        "/add_caption - রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)\n"
         "/delete_caption - রিপ্লাই করা মেসেজের ক্যাপশন মুছে ফেলুন (admin only)\n"
         "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
         "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
@@ -462,26 +462,52 @@ async def cancel_task_cb(c, cb):
 
 # ---- New Caption Handlers ----
 @app.on_message(filters.command("add_caption") & filters.private & filters.reply)
-async def add_caption_cmd(c, m: Message):
+async def add_caption_prompt_start(c, m: Message):
     if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
         return
         
-    if not m.reply_to_message:
-        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /add_caption কমান্ড দিন এবং নতুন ক্যাপশনটি লিখুন।")
+    uid = m.from_user.id
+    
+    # Check if a file is replied to
+    if not m.reply_to_message or not (m.reply_to_message.video or m.reply_to_message.document):
+        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /add_caption কমান্ড দিন।")
         return
+    
+    # Store the message ID for later use
+    LAST_FILE[uid] = m.reply_to_message.id
+    
+    example_text = (
+        "ক্যাপশন টেক্সট দিন অথবা নিচের উদাহরণগুলো থেকে বেছে নিন:\n"
+        "**উদাহরণ ১:** `{ +1 (3 up) }` - প্রতি ৩টি আপলোডের পর সংখ্যাটি ১ করে বাড়বে।\n"
+        "**উদাহরণ ২:** `{ repite (480p), (720p), (1080p), (4k) }` - চারটি ভিডিওর জন্য এই অপশনগুলো পর্যায়ক্রমে ব্যবহার হবে।"
+    )
+    
+    await m.reply_text(example_text, quote=True)
 
-    if len(m.command) < 2:
-        await m.reply_text("ক্যাপশন যোগ করতে নতুন ক্যাপশনটি লিখুন।\nউদাহরণ: /add_caption এটা আমার নতুন ক্যাপশন।")
-        return
-
-    new_caption = m.text.split(None, 1)[1].strip()
+# The handler that will receive the caption text
+@app.on_message(filters.me & filters.private & filters.text & filters.reply)
+async def handle_caption_text(c, m: Message):
+    uid = m.from_user.id
+    
+    if uid not in LAST_FILE:
+        return # Ignore if not part of the caption dialog
+        
+    target_message_id = LAST_FILE.pop(uid)
+    
+    # Get the replied message object
+    target_message = await c.get_messages(m.chat.id, target_message_id)
+    
+    if not target_message:
+        return # The target message might have been deleted
+        
+    caption_text = m.text
     
     try:
         await c.edit_message_caption(
             chat_id=m.chat.id,
-            message_id=m.reply_to_message.id,
-            caption=new_caption
+            message_id=target_message_id,
+            caption=caption_text
         )
         await m.reply_text("ক্যাপশন সফলভাবে যোগ করা হয়েছে।", quote=True)
     except Exception as e:
@@ -590,7 +616,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
                 "-c:a", "copy",
                 str(out_path)
             ]
-            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=false, timeout=3600)
+            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=False, timeout=3600)
             if result_full.returncode != 0:
                 raise Exception(f"Full re-encoding failed: {result_full.stderr}")
 
