@@ -36,9 +36,11 @@ LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
+USER_CAPTION_TEMPLATES = {} # New: to store user-specific templates
+USER_COUNTERS = {} # New: to store user-specific counters for dynamic captions
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-MAX_SIZE = 2 * 1024 * 1024 * 1024
+MAX_SIZE = 2 * 1024 * 1024 * 2048
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
@@ -175,12 +177,57 @@ async def set_bot_commands():
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("add_caption", "ক্যাপশন যোগ করুন (admin only)"),
+        BotCommand("delete_caption", "ক্যাপশন মুছে ফেলুন (admin only)"),
+        BotCommand("set_caption_template", "ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)"),
+        BotCommand("view_caption", "বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)"),
+        BotCommand("clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
         BotCommand("help", "সহায়িকা")
     ]
     try:
         await app.set_bot_commands(cmds)
     except Exception as e:
         logger.warning("Set commands error: %s", e)
+
+# ---- New: Dynamic caption generation utility ----
+def generate_dynamic_caption(uid, original_caption):
+    if uid not in USER_CAPTION_TEMPLATES:
+        return original_caption
+
+    template = USER_CAPTION_TEMPLATES[uid]
+    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
+    
+    final_caption = template
+    
+    # Process the {+1} logic
+    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
+    match_plus1 = re_plus1.search(final_caption)
+    if match_plus1:
+        up_count = int(match_plus1.group(1))
+        
+        # Check if the counter needs to be incremented based on the up_count
+        if counters["+1"] % up_count == 0:
+            if "last_episode" not in counters:
+                counters["last_episode"] = 1
+            else:
+                counters["last_episode"] += 1
+        
+        episode_number = counters.get("last_episode", 1)
+        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
+        
+    # Process the {repite} logic
+    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
+    match_repite = re_repite.search(final_caption)
+    if match_repite:
+        options = [opt.strip() for opt in match_repite.group(1).split(',')]
+        counters["repite"] = (counters["repite"] + 1) % len(options)
+        index = counters["repite"]
+        final_caption = final_caption.replace(match_repite.group(0), options[index])
+    
+    # After all replacements, increment the main counter for the next video
+    counters["+1"] += 1 
+    
+    return final_caption
 
 # ---- handlers ----
 @app.on_message(filters.command("start") & filters.private)
@@ -196,6 +243,11 @@ async def start_handler(c, m: Message):
         "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/add_caption <text> - রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)\n"
+        "/delete_caption - রিপ্লাই করা মেসেজের ক্যাপশন মুছে ফেলুন (admin only)\n"
+        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
+        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
+        "/clear_caption_template - ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)\n"
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
@@ -408,6 +460,92 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
+# ---- New Caption Handlers ----
+@app.on_message(filters.command("add_caption") & filters.private & filters.reply)
+async def add_caption_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+        
+    if not m.reply_to_message:
+        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /add_caption কমান্ড দিন এবং নতুন ক্যাপশনটি লিখুন।")
+        return
+
+    if len(m.command) < 2:
+        await m.reply_text("ক্যাপশন যোগ করতে নতুন ক্যাপশনটি লিখুন।\nউদাহরণ: /add_caption এটা আমার নতুন ক্যাপশন।")
+        return
+
+    new_caption = m.text.split(None, 1)[1].strip()
+    
+    try:
+        await c.edit_message_caption(
+            chat_id=m.chat.id,
+            message_id=m.reply_to_message.id,
+            caption=new_caption
+        )
+        await m.reply_text("ক্যাপশন সফলভাবে যোগ করা হয়েছে।", quote=True)
+    except Exception as e:
+        await m.reply_text(f"ক্যাপশন যোগ করতে ব্যর্থ: {e}", quote=True)
+
+@app.on_message(filters.command("delete_caption") & filters.private & filters.reply)
+async def delete_caption_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+        
+    if not m.reply_to_message:
+        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /delete_caption কমান্ড দিন।")
+        return
+
+    try:
+        await c.edit_message_caption(
+            chat_id=m.chat.id,
+            message_id=m.reply_to_message.id,
+            caption=""
+        )
+        await m.reply_text("ক্যাপশন সফলভাবে মুছে ফেলা হয়েছে।", quote=True)
+    except Exception as e:
+        await m.reply_text(f"ক্যাপশন মুছতে ব্যর্থ: {e}", quote=True)
+
+@app.on_message(filters.command("set_caption_template") & filters.private)
+async def set_caption_template_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+    
+    if len(m.command) < 2:
+        await m.reply_text("ক্যাপশন টেমপ্লেট সেট করার জন্য টেক্সট দিন। উদাহরণ:\n`/set_caption_template **Season - 01**, **Episode - {+1 (3 up)}**, **Quality - {repite (480p), (720p), (1080p), (4k)}**`")
+        return
+    
+    template = m.text.split(None, 1)[1].strip()
+    USER_CAPTION_TEMPLATES[m.from_user.id] = template
+    USER_COUNTERS[m.from_user.id] = {"+1": 0, "repite": -1}
+    await m.reply_text("ক্যাপশন টেমপ্লেট সফলভাবে সেভ হয়েছে।")
+
+@app.on_message(filters.command("clear_caption_template") & filters.private)
+async def clear_caption_template_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+        
+    USER_CAPTION_TEMPLATES.pop(m.from_user.id, None)
+    USER_COUNTERS.pop(m.from_user.id, None)
+    await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
+
+@app.on_message(filters.command("view_caption") & filters.private)
+async def view_caption_cmd(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
+        return
+    
+    uid = m.from_user.id
+    if uid in USER_CAPTION_TEMPLATES:
+        template = USER_CAPTION_TEMPLATES[uid]
+        await m.reply_text(f"আপনার বর্তমান সেভ করা ক্যাপশন টেমপ্লেটটি হলো:\n\n`{template}`")
+    else:
+        await m.reply_text("আপনার কোনো ক্যাপশন টেমপ্লেট সেভ করা নেই। `/set_caption_template` দিয়ে একটি টেমপ্লেট সেভ করুন।")
+
+
 # ---- main processing and upload ----
 async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
     try:
@@ -477,6 +615,9 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     try:
         final_name = original_name or in_path.name
         
+        caption_template = USER_CAPTION_TEMPLATES.get(uid, f"**{final_name}**")
+        final_caption = generate_dynamic_caption(uid, caption_template)
+        
         thumb_path = USER_THUMBS.get(uid)
 
         is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
@@ -518,7 +659,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                     await c.send_video(
                         chat_id=m.chat.id,
                         video=str(upload_path),
-                        caption=final_name,
+                        caption=final_caption,
                         thumb=thumb_path,
                         duration=duration_sec,
                         supports_streaming=True
@@ -528,10 +669,9 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         chat_id=m.chat.id,
                         document=str(upload_path),
                         file_name=final_name,
-                        caption=final_name
+                        caption=final_caption
                     )
                 
-                # --- নতুন লজিক: সব মেসেজ ডিলিট করা ---
                 if messages_to_delete:
                     try:
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
