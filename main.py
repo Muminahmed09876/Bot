@@ -739,30 +739,18 @@ async def broadcast_cmd_reply(c, m: Message):
 def home():
     return "Bot is running (Flask alive)."
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
-
-async def periodic_cleanup():
-    while True:
-        try:
-            now = datetime.now()
-            for p in TMP.iterdir():
-                try:
-                    if p.is_file():
-                        if now - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=3):
-                            p.unlink()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        await asyncio.sleep(3600)
+async def run_bot():
+    await app.start()
+    await app.idle()
 
 async def main():
-    print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-    await periodic_cleanup()
-    await app.run()
+    print("Bot চালু হচ্ছে...")
+    # asyncio টাস্ক হিসেবে Flask এবং Pyrogram উভয়কেই একসাথে চালান
+    flask_thread = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT), daemon=True)
+    flask_thread.start()
+    
+    # Pyrogram বটটিকে asyncio লুপে চালান
+    await run_bot()
 
 if __name__ == "__main__":
     try:
