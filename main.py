@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.enums import ParseMode
 from PIL import Image
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
@@ -32,11 +33,9 @@ TMP.mkdir(parents=True, exist_ok=True)
 
 # state
 USER_THUMBS = {}
-LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-# New state for captions
 SET_CAPTION_REQUEST = set()
 USER_CAPTIONS = {}
 # New state for dynamic captions
@@ -273,7 +272,6 @@ async def photo_handler(c, m: Message):
         except Exception as e:
             await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
     else:
-        # If not a thumb request, do nothing or handle as a regular photo
         pass
 
 # New handlers for caption
@@ -293,7 +291,7 @@ async def view_caption_cmd(c, m: Message):
     uid = m.from_user.id
     caption = USER_CAPTIONS.get(uid)
     if caption:
-        await m.reply_text(f"আপনার সেভ করা ক্যাপশন:\n\n**{caption}**", reply_markup=delete_caption_keyboard())
+        await m.reply_text(f"আপনার সেভ করা ক্যাপশন:\n\n`{caption}`", reply_markup=delete_caption_keyboard())
     else:
         await m.reply_text("আপনার কোনো ক্যাপশন সেভ করা নেই। /set_caption দিয়ে সেট করুন।")
 
@@ -523,40 +521,46 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
-        USER_COUNTERS[uid] = {'uploads': 0, 'episode_number': 1, 'quality_index': 0}
+        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}, 'quality_index': 0}
 
     # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
     # Episode Number Logic (e.g., [01 (+01, 3u)])
-    episode_match = re.search(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
-    if episode_match:
-        start_num = int(episode_match.group(1))
-        increment_val = int(episode_match.group(2))
-        uploads_per_inc = int(episode_match.group(3))
+    episode_matches = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
+    for match in episode_matches:
+        original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
+        start_num = int(match[0])
+        increment_val = int(match[1])
+        uploads_per_inc = int(match[2])
 
-        # Check if it's a new episode
-        if (USER_COUNTERS[uid]['uploads'] - 1) % uploads_per_inc == 0 and USER_COUNTERS[uid]['uploads'] > 1:
-             USER_COUNTERS[uid]['episode_number'] += increment_val
+        # Create a unique key for this specific episode code
+        code_key = f"episode_{start_num}_{increment_val}_{uploads_per_inc}"
+        if code_key not in USER_COUNTERS[uid]['episode_numbers']:
+            USER_COUNTERS[uid]['episode_numbers'][code_key] = start_num
+        
+        # Calculate the current episode number
+        current_uploads = USER_COUNTERS[uid]['uploads']
+        episode_number = start_num + ((current_uploads - 1) // uploads_per_inc) * increment_val
+        
+        # Format the number with leading zeros if necessary
+        formatted_episode_number = f"{episode_number:02d}"
 
-        current_episode = start_num + ((USER_COUNTERS[uid]['uploads'] - 1) // uploads_per_inc) * increment_val
-        caption_template = caption_template.replace(episode_match.group(0), f"{current_episode:02d}")
+        caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
 
     # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
-    quality_match = re.search(r"\[re\s*\((.*?)\)\]", caption_template)
+    quality_match = re.search(r"\[re\s*\(.*?\)\]", caption_template)
     if quality_match:
-        options_str = quality_match.group(1)
-        options = [opt.strip() for opt in options_str.split(',')]
+        options_str = quality_match.group(0)
+        options_list_str = options_str[options_str.find("(") + 1:options_str.rfind(")")]
+        options = [opt.strip().strip("()") for opt in options_list_str.split(',')]
         
         current_index = (USER_COUNTERS[uid]['uploads'] - 1) % len(options)
-        current_quality = options[current_index].strip()
+        current_quality = options[current_index]
         
-        # Remove extra parentheses if present
-        current_quality = re.sub(r"^\((.*)\)$", r"\1", current_quality)
-
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
     
-    return caption_template
+    return "**" + "\n".join(caption_template.splitlines()) + "**"
 
 
 async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
@@ -565,14 +569,11 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     TASKS.setdefault(uid, []).append(cancel_event)
     
     upload_path = in_path
-    
     temp_thumb_path = None
-    
     final_caption_template = USER_CAPTIONS.get(uid)
 
     try:
         final_name = original_name or in_path.name
-        
         thumb_path = USER_THUMBS.get(uid)
 
         is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
@@ -606,7 +607,6 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         
         duration_sec = get_video_duration(upload_path) if upload_path.exists() else 0
         
-        # Determine the final caption based on user's request
         caption_to_use = final_name
         if final_caption_template:
             caption_to_use = process_dynamic_caption(uid, final_caption_template)
@@ -622,17 +622,18 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         caption=caption_to_use,
                         thumb=thumb_path,
                         duration=duration_sec,
-                        supports_streaming=True
+                        supports_streaming=True,
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await c.send_document(
                         chat_id=m.chat.id,
                         document=str(upload_path),
                         file_name=final_name,
-                        caption=caption_to_use
+                        caption=caption_to_use,
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 
-                # --- নতুন লজিক: সব মেসেজ ডিলিট করা ---
                 if messages_to_delete:
                     try:
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
