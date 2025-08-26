@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", "5000"))
 
 # MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "TA_HD_File_Share")
+DB_NAME = os.getenv("DB_NAME", "telegram_bot_db")
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
@@ -72,7 +72,7 @@ db_client = connect_db()
 
 def load_data_from_db():
     global USER_CAPTION_TEMPLATES, USER_COUNTERS, USER_THUMBS, SUBSCRIBERS
-    if not db_client:
+    if db_client is None:
         return
 
     try:
@@ -101,7 +101,7 @@ def load_data_from_db():
         logger.error("Failed to load data from MongoDB: %s", e)
 
 def save_caption_data(uid):
-    if not db_client:
+    if db_client is None:
         return
     try:
         collection = db_client["caption_data"]
@@ -115,7 +115,7 @@ def save_caption_data(uid):
         logger.error("Failed to save caption data to MongoDB for user %s: %s", uid, e)
 
 def save_thumb_path(uid, thumb_path):
-    if not db_client:
+    if db_client is None:
         return
     try:
         collection = db_client["thumb_data"]
@@ -125,7 +125,7 @@ def save_thumb_path(uid, thumb_path):
         logger.error("Failed to save thumb path to MongoDB for user %s: %s", uid, e)
 
 def delete_thumb_path(uid):
-    if not db_client:
+    if db_client is None:
         return
     try:
         collection = db_client["thumb_data"]
@@ -134,7 +134,7 @@ def delete_thumb_path(uid):
         logger.error("Failed to delete thumb path from MongoDB for user %s: %s", uid, e)
 
 def add_subscriber(chat_id):
-    if not db_client:
+    if db_client is None:
         return
     try:
         collection = db_client["subscribers"]
@@ -143,7 +143,7 @@ def add_subscriber(chat_id):
         logger.error("Failed to add subscriber to MongoDB: %s", e)
 
 def get_all_subscribers():
-    if not db_client:
+    if db_client is None:
         return []
     try:
         collection = db_client["subscribers"]
@@ -285,6 +285,258 @@ async def set_bot_commands():
         BotCommand("set_caption_template", "ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)"),
         BotCommand("view_caption", "বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)"),
         BotCommand("clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("help", "সহায়িকা")
+    ]
+    try:
+        await app.set_bot_commands(cmds)
+    except Exception as e:
+        logger.warning("Set commands error: %s", e)
+
+def generate_dynamic_caption(uid, original_caption):
+    if uid not in USER_CAPTION_TEMPLATES:
+        return original_caption
+
+    template = USER_CAPTION_TEMPLATES[uid]
+    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
+    
+    final_caption = template
+    
+    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
+    match_plus1 = re_plus1.search(final_caption)
+    if match_plus1:
+        up_count = int(match_plus1.group(1))
+        
+        if counters["+1"] % up_count == 0:
+            if "last_episode" not in counters:
+                counters["last_episode"] = 1
+            else:
+                counters["last_episode"] += 1
+        
+        episode_number = counters.get("last_episode", 1)
+        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
+        
+    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
+    match_repite = re_repite.search(final_caption)
+    if match_repite:
+        options = [opt.strip() for opt in match_repite.group(1).split(',')]
+        counters["repite"] = (counters["repite"] + 1) % len(options)
+        index = counters["repite"]
+        final_caption = final_caption.replace(match_repite.group(0), options[index])
+    
+    counters["+1"] += 1 
+    
+    save_caption_data(uid)
+    
+    return final_caption
+
+# ---- handlers ----
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(c, m: Message):
+    await set_bot_commands()
+    SUBSCRIBERS.add(m.chat.id)
+    add_subscriber(m.chat.id)
+    text = (
+        "Hi! আমি URL uploader bot.\n\n"
+        "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
+        "Commands:\n"
+        "/upload_url <url> - URL থেকে ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
+        "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
+        "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
+        "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
+        "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
+        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
+        "/clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("help", "সহায়িকা")
+    ]
+    try:
+        await app.set_bot_commands(cmds)
+    except Exception as e:
+        logger.warning("Set commands error: %s", e)
+
+def generate_dynamic_caption(uid, original_caption):
+    if uid not in USER_CAPTION_TEMPLATES:
+        return original_caption
+
+    template = USER_CAPTION_TEMPLATES[uid]
+    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
+    
+    final_caption = template
+    
+    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
+    match_plus1 = re_plus1.search(final_caption)
+    if match_plus1:
+        up_count = int(match_plus1.group(1))
+        
+        if counters["+1"] % up_count == 0:
+            if "last_episode" not in counters:
+                counters["last_episode"] = 1
+            else:
+                counters["last_episode"] += 1
+        
+        episode_number = counters.get("last_episode", 1)
+        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
+        
+    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
+    match_repite = re_repite.search(final_caption)
+    if match_repite:
+        options = [opt.strip() for opt in match_repite.group(1).split(',')]
+        counters["repite"] = (counters["repite"] + 1) % len(options)
+        index = counters["repite"]
+        final_caption = final_caption.replace(match_repite.group(0), options[index])
+    
+    counters["+1"] += 1 
+    
+    save_caption_data(uid)
+    
+    return final_caption
+
+# ---- handlers ----
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(c, m: Message):
+    await set_bot_commands()
+    SUBSCRIBERS.add(m.chat.id)
+    add_subscriber(m.chat.id)
+    text = (
+        "Hi! আমি URL uploader bot.\n\n"
+        "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
+        "Commands:\n"
+        "/upload_url <url> - URL থেকে ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
+        "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
+        "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
+        "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
+        "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
+        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
+        "/clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("help", "সহায়িকা")
+    ]
+    try:
+        await app.set_bot_commands(cmds)
+    except Exception as e:
+        logger.warning("Set commands error: %s", e)
+
+def generate_dynamic_caption(uid, original_caption):
+    if uid not in USER_CAPTION_TEMPLATES:
+        return original_caption
+
+    template = USER_CAPTION_TEMPLATES[uid]
+    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
+    
+    final_caption = template
+    
+    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
+    match_plus1 = re_plus1.search(final_caption)
+    if match_plus1:
+        up_count = int(match_plus1.group(1))
+        
+        if counters["+1"] % up_count == 0:
+            if "last_episode" not in counters:
+                counters["last_episode"] = 1
+            else:
+                counters["last_episode"] += 1
+        
+        episode_number = counters.get("last_episode", 1)
+        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
+        
+    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
+    match_repite = re_repite.search(final_caption)
+    if match_repite:
+        options = [opt.strip() for opt in match_repite.group(1).split(',')]
+        counters["repite"] = (counters["repite"] + 1) % len(options)
+        index = counters["repite"]
+        final_caption = final_caption.replace(match_repite.group(0), options[index])
+    
+    counters["+1"] += 1 
+    
+    save_caption_data(uid)
+    
+    return final_caption
+
+# ---- handlers ----
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(c, m: Message):
+    await set_bot_commands()
+    SUBSCRIBERS.add(m.chat.id)
+    add_subscriber(m.chat.id)
+    text = (
+        "Hi! আমি URL uploader bot.\n\n"
+        "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
+        "Commands:\n"
+        "/upload_url <url> - URL থেকে ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
+        "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
+        "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
+        "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
+        "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
+        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
+        "/clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("help", "সহায়িকা")
+    ]
+    try:
+        await app.set_bot_commands(cmds)
+    except Exception as e:
+        logger.warning("Set commands error: %s", e)
+
+def generate_dynamic_caption(uid, original_caption):
+    if uid not in USER_CAPTION_TEMPLATES:
+        return original_caption
+
+    template = USER_CAPTION_TEMPLATES[uid]
+    counters = USER_COUNTERS.setdefault(uid, {"+1": 0, "repite": -1})
+    
+    final_caption = template
+    
+    re_plus1 = re.compile(r"\{ *\+1 *\( *(\d+) *up\) *\}")
+    match_plus1 = re_plus1.search(final_caption)
+    if match_plus1:
+        up_count = int(match_plus1.group(1))
+        
+        if counters["+1"] % up_count == 0:
+            if "last_episode" not in counters:
+                counters["last_episode"] = 1
+            else:
+                counters["last_episode"] += 1
+        
+        episode_number = counters.get("last_episode", 1)
+        final_caption = final_caption.replace(match_plus1.group(0), str(episode_number).zfill(2))
+        
+    re_repite = re.compile(r"\{ *repite *\(([^)]+)\) *\}")
+    match_repite = re_repite.search(final_caption)
+    if match_repite:
+        options = [opt.strip() for opt in match_repite.group(1).split(',')]
+        counters["repite"] = (counters["repite"] + 1) % len(options)
+        index = counters["repite"]
+        final_caption = final_caption.replace(match_repite.group(0), options[index])
+    
+    counters["+1"] += 1 
+    
+    save_caption_data(uid)
+    
+    return final_caption
+
+# ---- handlers ----
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(c, m: Message):
+    await set_bot_commands()
+    SUBSCRIBERS.add(m.chat.id)
+    add_subscriber(m.chat.id)
+    text = (
+        "Hi! আমি URL uploader bot.\n\n"
+        "নোট: বটের অনেক কমান্ড শুধু অ্যাডমিন (owner) চালাতে পারবে।\n\n"
+        "Commands:\n"
+        "/upload_url <url> - URL থেকে ডাউনলোড ও Telegram-এ আপলোড (admin only)\n"
+        "/setthumb - একটি ছবি পাঠান, সেট হবে আপনার থাম্বনেইল (admin only)\n"
+        "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
+        "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
+        "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
+        "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
+        "/clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -627,7 +879,7 @@ async def clear_caption_template_cmd(c, m: Message):
     if uid in USER_CAPTION_TEMPLATES:
         USER_CAPTION_TEMPLATES.pop(uid, None)
         USER_COUNTERS.pop(uid, None)
-        if db_client:
+        if db_client is not None:
             try:
                 collection = db_client["caption_data"]
                 collection.delete_one({"user_id": uid})
