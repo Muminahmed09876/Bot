@@ -142,7 +142,8 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.
+Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -281,6 +282,8 @@ async def set_caption_prompt(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     SET_CAPTION_REQUEST.add(m.from_user.id)
+    # Reset counter data when a new caption is about to be set
+    USER_COUNTERS.pop(m.from_user.id, None)
     await m.reply_text("ক্যাপশন দিন।")
 
 @app.on_message(filters.command("view_caption") & filters.private)
@@ -303,6 +306,7 @@ async def delete_caption_cb(c, cb):
         return
     if uid in USER_CAPTIONS:
         USER_CAPTIONS.pop(uid)
+        USER_COUNTERS.pop(uid, None) # New: delete counter data
         await cb.message.edit_text("আপনার ক্যাপশন মুছে ফেলা হয়েছে।")
     else:
         await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
@@ -318,6 +322,7 @@ async def text_handler(c, m: Message):
     if uid in SET_CAPTION_REQUEST:
         SET_CAPTION_REQUEST.discard(uid)
         USER_CAPTIONS[uid] = text
+        USER_COUNTERS.pop(uid, None) # New: reset counter on new caption set
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
 
@@ -521,15 +526,15 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
-        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}, 'quality_index': 0}
+        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}}
 
     # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
-    # Episode Number Logic (e.g., [01 (+01, 3u)])
-    episode_matches = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
+    # Episode Number Logic (e.g., [(01) (+1, 3u)])
+    episode_matches = re.findall(r"\[\((\d+)\) \(\+(\d+), (\d+)u\)\]", caption_template)
     for match in episode_matches:
-        original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
+        original_placeholder = f"[({match[0]}) (+{match[1]}, {match[2]}u)]"
         start_num = int(match[0])
         increment_val = int(match[1])
         uploads_per_inc = int(match[2])
@@ -546,7 +551,27 @@ def process_dynamic_caption(uid, caption_template):
         # Format the number with leading zeros if necessary
         formatted_episode_number = f"{episode_number:02d}"
 
+        caption_template = caption_template.replace(original_placeholder, f"({formatted_episode_number})", 1)
+
+    # Episode Number Logic (e.g., [01 (+01, 3u)])
+    episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
+    for match in episode_matches_no_paren:
+        original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
+        start_num = int(match[0])
+        increment_val = int(match[1])
+        uploads_per_inc = int(match[2])
+        
+        code_key = f"episode_{start_num}_{increment_val}_{uploads_per_inc}"
+        if code_key not in USER_COUNTERS[uid]['episode_numbers']:
+            USER_COUNTERS[uid]['episode_numbers'][code_key] = start_num
+        
+        current_uploads = USER_COUNTERS[uid]['uploads']
+        episode_number = start_num + ((current_uploads - 1) // uploads_per_inc) * increment_val
+        
+        formatted_episode_number = f"{episode_number:02d}"
+        
         caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
+
 
     # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
     quality_match = re.search(r"\[re\s*\(.*?\)\]", caption_template)
