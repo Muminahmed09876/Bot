@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", "5000"))
 
 # MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "telegram_bot_db")
+DB_NAME = os.getenv("DB_NAME", "TA_HD_File_Share")
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
