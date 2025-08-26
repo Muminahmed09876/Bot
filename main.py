@@ -142,7 +142,8 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.
+Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -739,21 +740,31 @@ async def broadcast_cmd_reply(c, m: Message):
 def home():
     return "Bot is running (Flask alive)."
 
-async def run_bot():
-    await app.start()
-    await app.idle()
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT)
 
-async def main():
-    print("Bot চালু হচ্ছে...")
-    # asyncio টাস্ক হিসেবে Flask এবং Pyrogram উভয়কেই একসাথে চালান
-    flask_thread = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT), daemon=True)
-    flask_thread.start()
-    
-    # Pyrogram বটটিকে asyncio লুপে চালান
-    await run_bot()
+async def periodic_cleanup():
+    while True:
+        try:
+            now = datetime.now()
+            for p in TMP.iterdir():
+                try:
+                    if p.is_file():
+                        if now - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=3):
+                            p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
+    print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("বট বন্ধ হচ্ছে...")
+        loop = asyncio.get_event_loop()
+        loop.create_task(periodic_cleanup())
+    except RuntimeError:
+        pass
+    app.run()
