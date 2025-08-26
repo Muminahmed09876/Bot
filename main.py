@@ -17,6 +17,7 @@ from flask import Flask
 import time
 import math
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,14 +37,40 @@ LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-USER_CAPTION_TEMPLATES = {}  # New: to store user-specific templates
-USER_COUNTERS = {}  # New: to store user-specific counters for dynamic captions
+USER_CAPTION_TEMPLATES = {}
+USER_COUNTERS = {}
+USER_SETTING_CAPTION = set()  # New: To track users in caption setting mode
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 2 * 1024 * 1024 * 2048
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
+
+# ---- New: Data persistence functions ----
+CAPTION_DATA_FILE = "caption_data.json"
+
+def load_caption_data():
+    global USER_CAPTION_TEMPLATES, USER_COUNTERS
+    if os.path.exists(CAPTION_DATA_FILE):
+        try:
+            with open(CAPTION_DATA_FILE, "r") as f:
+                data = json.load(f)
+                USER_CAPTION_TEMPLATES = {int(k): v for k, v in data.get("templates", {}).items()}
+                USER_COUNTERS = {int(k): v for k, v in data.get("counters", {}).items()}
+        except (IOError, json.JSONDecodeError) as e:
+            logger.error("Failed to load caption data: %s", e)
+
+def save_caption_data():
+    try:
+        with open(CAPTION_DATA_FILE, "w") as f:
+            json.dump({
+                "templates": USER_CAPTION_TEMPLATES,
+                "counters": USER_COUNTERS
+            }, f)
+    except IOError as e:
+        logger.error("Failed to save caption data: %s", e)
+
 
 # ---- utilities ----
 def is_admin(uid: int) -> bool:
@@ -224,6 +251,9 @@ def generate_dynamic_caption(uid, original_caption):
     
     # After all replacements, increment the main counter for the next video
     counters["+1"] += 1 
+    
+    # Save the updated counters to the file
+    save_caption_data()
     
     return final_caption
 
@@ -466,21 +496,53 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
-# ---- New Caption Handlers (unchanged) ----
+# ---- New Caption Handlers ----
 @app.on_message(filters.command("set_caption_template") & filters.private)
-async def set_caption_template_cmd(c, m: Message):
+async def set_caption_prompt_start(c, m: Message):
     if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
+        return
+        
+    uid = m.from_user.id
+    
+    # Store the user ID to know who to wait for a caption from
+    USER_SETTING_CAPTION.add(uid)
+    
+    example_text = (
+        "ক্যাপশন টেমপ্লেট টেক্সট দিন।\n"
+        "এই টেমপ্লেট ব্যবহার করে আপনি ডাইনামিক ক্যাপশন তৈরি করতে পারেন:\n\n"
+        "**উদাহরণ ১:** `{+1 (3 up)}`\n"
+        "এটি প্রতি ৩টি আপলোডের পর একটি করে সংখ্যা বাড়াবে।\n\n"
+        "**উদাহরণ ২:** `{repite (480p), (720p)}`\n"
+        "এটি পর্যায়ক্রমে ৪টি ভিডিওর জন্য `(480p)`, `(720p)`, `(480p)`, `(720p)` এভাবে ব্যবহার হবে।\n\n"
+        "**উদাহরণ ৩:**\n"
+        "`**Season - 01**, **Episode - {+1 (1 up)}**, **Quality - {repite (480p), (720p)}**`"
+    )
+    
+    await m.reply_text(example_text, quote=True)
+
+@app.on_message(filters.private & filters.text & filters.reply)
+async def handle_caption_template_text(c, m: Message):
+    uid = m.from_user.id
+    
+    # Check if this user is in the caption setting state
+    if uid not in USER_SETTING_CAPTION:
         return
     
-    if len(m.command) < 2:
-        await m.reply_text("ক্যাপশন টেমপ্লেট সেট করার জন্য টেক্সট দিন। উদাহরণ:\n`/set_caption_template **Season - 01**, **Episode - {+1 (3 up)}**, **Quality - {repite (480p), (720p), (1080p), (4k)}**`")
+    # The reply must be to a message from the bot
+    if not m.reply_to_message or m.reply_to_message.from_user.id != c.me.id:
         return
+
+    # Remove user from the state
+    USER_SETTING_CAPTION.discard(uid)
     
-    template = m.text.split(None, 1)[1].strip()
-    USER_CAPTION_TEMPLATES[m.from_user.id] = template
-    USER_COUNTERS[m.from_user.id] = {"+1": 0, "repite": -1}
-    await m.reply_text("ক্যাপশন টেমপ্লেট সফলভাবে সেভ হয়েছে।")
+    template = m.text.strip()
+    USER_CAPTION_TEMPLATES[uid] = template
+    USER_COUNTERS[uid] = {"+1": 0, "repite": -1}
+    save_caption_data()
+    
+    await m.reply_text("ক্যাপশন টেমপ্লেট সফলভাবে সেভ হয়েছে।", quote=True)
+
 
 @app.on_message(filters.command("clear_caption_template") & filters.private)
 async def clear_caption_template_cmd(c, m: Message):
@@ -490,6 +552,7 @@ async def clear_caption_template_cmd(c, m: Message):
         
     USER_CAPTION_TEMPLATES.pop(m.from_user.id, None)
     USER_COUNTERS.pop(m.from_user.id, None)
+    save_caption_data()
     await m.reply_text("ক্যাপশন টেমপ্লেট মুছে ফেলা হয়েছে।")
 
 @app.on_message(filters.command("view_caption") & filters.private)
@@ -737,6 +800,7 @@ async def periodic_cleanup():
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
+    load_caption_data() # Load data on startup
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     try:
