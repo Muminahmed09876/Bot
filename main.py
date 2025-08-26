@@ -36,8 +36,8 @@ LAST_FILE = {}
 TASKS = {}
 SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-USER_CAPTION_TEMPLATES = {} # New: to store user-specific templates
-USER_COUNTERS = {} # New: to store user-specific counters for dynamic captions
+USER_CAPTION_TEMPLATES = {}  # New: to store user-specific templates
+USER_COUNTERS = {}  # New: to store user-specific counters for dynamic captions
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 2 * 1024 * 1024 * 2048
@@ -176,8 +176,6 @@ async def set_bot_commands():
         BotCommand("view_thumb", "আপনার থাম্বনেইল দেখুন (admin only)"),
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
-        BotCommand("add_caption", "রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)"),
-        BotCommand("delete_caption", "রিপ্লাই করা মেসেজের ক্যাপশন মুছে ফেলুন (admin only)"),
         BotCommand("set_caption_template", "ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)"),
         BotCommand("view_caption", "বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)"),
         BotCommand("clear_caption_template", "ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)"),
@@ -243,12 +241,10 @@ async def start_handler(c, m: Message):
         "/view_thumb - আপনার থাম্বনেইল দেখুন (admin only)\n"
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
-        "/add_caption - রিপ্লাই করা মেসেজে নতুন ক্যাপশন যোগ করুন (admin only)\n"
-        "/delete_caption - রিপ্লাই করা মেসেজের ক্যাপশন মুছে ফেলুন (admin only)\n"
         "/set_caption_template - ডাইনামিক ক্যাপশন টেমপ্লেট সেট করুন (admin only)\n"
         "/view_caption - বর্তমান ক্যাপশন টেমপ্লেট দেখুন (admin only)\n"
         "/clear_caption_template - ক্যাপশন টেমপ্লেট মুছে ফেলুন (admin only)\n"
-        "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
+        "/broadcast <text> - ব্রডকাস্ট (কেবল অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
     await m.reply_text(text)
@@ -321,10 +317,14 @@ async def upload_url_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     if not m.command or len(m.command) < 2:
-        await m.reply_text("ব্যবহার: /upload_url <url>\nউদাহরণ: /upload_url https://example.com/file.mp4")
+        await m.reply_text("ব্যবহার: /upload_url <url> [ক্যাপশন]\nউদাহরণ: /upload_url https://example.com/file.mp4 নতুন ভিডিও ক্যাপশন")
         return
-    url = m.text.split(None, 1)[1].strip()
-    asyncio.create_task(handle_url_download_and_upload(c, m, url))
+    
+    parts = m.text.split(None, 2)
+    url = parts[1].strip()
+    caption = parts[2] if len(parts) > 2 else None
+    
+    asyncio.create_task(handle_url_download_and_upload(c, m, url, caption_text=caption))
 
 @app.on_message(filters.text & filters.private)
 async def auto_url_upload(c, m: Message):
@@ -332,9 +332,11 @@ async def auto_url_upload(c, m: Message):
         return
     text = m.text.strip()
     if text.startswith("http://") or text.startswith("https://"):
-        asyncio.create_task(handle_url_download_and_upload(c, m, text))
+        url = text.split(" ")[0]
+        caption = text.split(" ", 1)[1] if len(text.split(" ")) > 1 else None
+        asyncio.create_task(handle_url_download_and_upload(c, m, url, caption_text=caption))
 
-async def handle_url_download_and_upload(c: Client, m: Message, url: str):
+async def handle_url_download_and_upload(c: Client, m: Message, url: str, caption_text: str = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -372,7 +374,7 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             return
 
         await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
+        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id], caption_text=caption_text)
     except Exception as e:
         traceback.print_exc()
         await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
@@ -418,12 +420,16 @@ async def rename_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই।")
         return
     if not m.reply_to_message or not (m.reply_to_message.video or m.reply_to_message.document):
-        await m.reply_text("ভিডিও/ডকুমেন্ট ফাইলের reply দিয়ে এই কমান্ড দিন।\nUsage: /rename new_name.mp4")
+        await m.reply_text("ভিডিও/ডকুমেন্ট ফাইলের reply দিয়ে এই কমান্ড দিন।\nUsage: /rename <new_name.ext> [ক্যাপশন]")
         return
     if len(m.command) < 2:
         await m.reply_text("নতুন ফাইল নাম দিন। উদাহরণ: /rename new_video.mp4")
         return
-    new_name = m.text.split(None, 1)[1].strip()
+    
+    parts = m.text.split(None, 2)
+    new_name = parts[1].strip()
+    caption = parts[2] if len(parts) > 2 else None
+    
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
     await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
 
@@ -434,7 +440,7 @@ async def rename_cmd(c, m: Message):
     try:
         await m.reply_to_message.download(file_name=str(tmp_out))
         await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id])
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id], caption_text=caption)
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
@@ -460,79 +466,7 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
-# ---- New Caption Handlers ----
-@app.on_message(filters.command("add_caption") & filters.private & filters.reply)
-async def add_caption_prompt_start(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ডটি ব্যবহার করার।")
-        return
-        
-    uid = m.from_user.id
-    
-    # Check if a file is replied to
-    if not m.reply_to_message or not (m.reply_to_message.video or m.reply_to_message.document):
-        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /add_caption কমান্ড দিন।")
-        return
-    
-    # Store the message ID for later use
-    LAST_FILE[uid] = m.reply_to_message.id
-    
-    example_text = (
-        "ক্যাপশন টেক্সট দিন অথবা নিচের উদাহরণগুলো থেকে বেছে নিন:\n"
-        "**উদাহরণ ১:** `{ +1 (3 up) }` - প্রতি ৩টি আপলোডের পর সংখ্যাটি ১ করে বাড়বে।\n"
-        "**উদাহরণ ২:** `{ repite (480p), (720p), (1080p), (4k) }` - চারটি ভিডিওর জন্য এই অপশনগুলো পর্যায়ক্রমে ব্যবহার হবে।"
-    )
-    
-    await m.reply_text(example_text, quote=True)
-
-# The handler that will receive the caption text
-@app.on_message(filters.me & filters.private & filters.text & filters.reply)
-async def handle_caption_text(c, m: Message):
-    uid = m.from_user.id
-    
-    if uid not in LAST_FILE:
-        return # Ignore if not part of the caption dialog
-        
-    target_message_id = LAST_FILE.pop(uid)
-    
-    # Get the replied message object
-    target_message = await c.get_messages(m.chat.id, target_message_id)
-    
-    if not target_message:
-        return # The target message might have been deleted
-        
-    caption_text = m.text
-    
-    try:
-        await c.edit_message_caption(
-            chat_id=m.chat.id,
-            message_id=target_message_id,
-            caption=caption_text
-        )
-        await m.reply_text("ক্যাপশন সফলভাবে যোগ করা হয়েছে।", quote=True)
-    except Exception as e:
-        await m.reply_text(f"ক্যাপশন যোগ করতে ব্যর্থ: {e}", quote=True)
-
-@app.on_message(filters.command("delete_caption") & filters.private & filters.reply)
-async def delete_caption_cmd(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
-        return
-        
-    if not m.reply_to_message:
-        await m.reply_text("একটি ফাইল (ভিডিও, ডকুমেন্ট ইত্যাদি) রিপ্লাই করে /delete_caption কমান্ড দিন।")
-        return
-
-    try:
-        await c.edit_message_caption(
-            chat_id=m.chat.id,
-            message_id=m.reply_to_message.id,
-            caption=""
-        )
-        await m.reply_text("ক্যাপশন সফলভাবে মুছে ফেলা হয়েছে।", quote=True)
-    except Exception as e:
-        await m.reply_text(f"ক্যাপশন মুছতে ব্যর্থ: {e}", quote=True)
-
+# ---- New Caption Handlers (unchanged) ----
 @app.on_message(filters.command("set_caption_template") & filters.private)
 async def set_caption_template_cmd(c, m: Message):
     if not is_admin(m.from_user.id):
@@ -629,7 +563,7 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         return False, str(e)
 
 
-async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
+async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None, caption_text: str = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -641,8 +575,12 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     try:
         final_name = original_name or in_path.name
         
-        caption_template = USER_CAPTION_TEMPLATES.get(uid, f"**{final_name}**")
-        final_caption = generate_dynamic_caption(uid, caption_template)
+        # Check if a specific caption text was provided
+        if caption_text:
+            final_caption = caption_text
+        else:
+            caption_template = USER_CAPTION_TEMPLATES.get(uid, f"**{final_name}**")
+            final_caption = generate_dynamic_caption(uid, caption_template)
         
         thumb_path = USER_THUMBS.get(uid)
 
