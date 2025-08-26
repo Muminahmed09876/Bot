@@ -141,7 +141,7 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.2Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -568,11 +568,10 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         
         duration_sec = get_video_duration(upload_path) if upload_path.exists() else 0
         
-        # Determine the final caption
+        # Determine the final caption based on user's request
         caption_to_use = final_name
         if final_caption:
-            caption_to_use = f"{final_name}\n\n{final_caption}"
-
+            caption_to_use = final_caption
 
         upload_attempts = 3
         last_exc = None
