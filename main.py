@@ -39,6 +39,8 @@ SUBSCRIBERS = set()
 # New state for captions
 SET_CAPTION_REQUEST = set()
 USER_CAPTIONS = {}
+# New state for dynamic captions
+USER_COUNTERS = {}
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 2 * 1024 * 1024 * 1024
@@ -518,6 +520,44 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         logger.error("Video conversion error: %s", e)
         return False, str(e)
 
+def process_dynamic_caption(uid, caption_template):
+    # Initialize user state if it doesn't exist
+    if uid not in USER_COUNTERS:
+        USER_COUNTERS[uid] = {'uploads': 0, 'episode_number': 1, 'quality_index': 0}
+
+    # Increment upload counter for the current user
+    USER_COUNTERS[uid]['uploads'] += 1
+
+    # Episode Number Logic (e.g., [01 (+01, 3u)])
+    episode_match = re.search(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
+    if episode_match:
+        start_num = int(episode_match.group(1))
+        increment_val = int(episode_match.group(2))
+        uploads_per_inc = int(episode_match.group(3))
+
+        # Check if it's a new episode
+        if (USER_COUNTERS[uid]['uploads'] - 1) % uploads_per_inc == 0 and USER_COUNTERS[uid]['uploads'] > 1:
+             USER_COUNTERS[uid]['episode_number'] += increment_val
+
+        current_episode = start_num + ((USER_COUNTERS[uid]['uploads'] - 1) // uploads_per_inc) * increment_val
+        caption_template = caption_template.replace(episode_match.group(0), f"{current_episode:02d}")
+
+    # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
+    quality_match = re.search(r"\[re\s*\((.*?)\)\]", caption_template)
+    if quality_match:
+        options_str = quality_match.group(1)
+        options = [opt.strip() for opt in options_str.split(',')]
+        
+        current_index = (USER_COUNTERS[uid]['uploads'] - 1) % len(options)
+        current_quality = options[current_index].strip()
+        
+        # Remove extra parentheses if present
+        current_quality = re.sub(r"^\((.*)\)$", r"\1", current_quality)
+
+        caption_template = caption_template.replace(quality_match.group(0), current_quality)
+    
+    return caption_template
+
 
 async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
     uid = m.from_user.id
@@ -528,9 +568,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     
     temp_thumb_path = None
     
-    final_caption = None
-    if uid in USER_CAPTIONS:
-        final_caption = f"**{USER_CAPTIONS[uid]}**"
+    final_caption_template = USER_CAPTIONS.get(uid)
 
     try:
         final_name = original_name or in_path.name
@@ -570,8 +608,8 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         
         # Determine the final caption based on user's request
         caption_to_use = final_name
-        if final_caption:
-            caption_to_use = final_caption
+        if final_caption_template:
+            caption_to_use = process_dynamic_caption(uid, final_caption_template)
 
         upload_attempts = 3
         last_exc = None
