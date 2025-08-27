@@ -4,12 +4,6 @@ import re
 import aiohttp
 import asyncio
 import threading
-import subprocess
-import traceback
-import logging
-import socket
-import struct
-import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
@@ -18,85 +12,13 @@ from pyrogram.enums import ParseMode
 from PIL import Image
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
-from flask import Flask
+import subprocess
+import traceback
+from flask import Flask, render_template_string
+import requests # Added requests for ping service
+import time
 import math
-
-# ---- PINGING CODE START ----
-def checksum(source_string: bytes) -> int:
-    """
-    Calculates the 16-bit one's complement of the one's complement sum
-    of all 16-bit words in the given byte string.
-    """
-    count_to = (len(source_string) // 2) * 2
-    sum_val = 0
-    count = 0
-
-    while count < count_to:
-        this_val = source_string[count + 1] * 256 + source_string[count]
-        sum_val += this_val
-        sum_val &= 0xffffffff
-        count += 2
-
-    if count_to < len(source_string):
-        sum_val += source_string[len(source_string) - 1]
-        sum_val &= 0xffffffff
-
-    sum_val = (sum_val >> 16) + (sum_val & 0xffff)
-    sum_val += (sum_val >> 16)
-    return (~sum_val) & 0xffff
-
-def create_icmp_packet(id: int) -> bytes:
-    """
-    Creates a new ICMP echo request packet.
-    """
-    header = struct.pack('bbHHh', 8, 0, 0, id, 1)
-    data = b'A' * 192
-    chksum = checksum(header + data)
-    header = struct.pack('bbHHh', 8, 0, socket.htons(chksum), id, 1)
-    return header + data
-
-async def ping_host(host: str, timeout: int = 2) -> dict:
-    """
-    Pings a host and returns the result.
-    """
-    try:
-        dest_addr = socket.gethostbyname(host)
-    except socket.gaierror:
-        return {"success": False, "error": f"Could not resolve hostname '{host}'.", "host": host}
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock.settimeout(timeout)
-    except socket.error as e:
-        return {"success": False, "error": f"You need root/admin privileges to ping. {e}", "host": host}
-
-    packet_id = os.getpid() & 0xffff
-    packet = create_icmp_packet(packet_id)
-
-    start_time = time.time()
-    try:
-        sock.sendto(packet, (dest_addr, 1))
-        data, addr = sock.recvfrom(1024)
-        end_time = time.time()
-        
-        rtt = (end_time - start_time) * 1000
-        sock.close()
-        
-        icmp_header = data[20:28]
-        type, code, _, packet_id_reply, sequence = struct.unpack('bbHHh', icmp_header)
-        
-        if type == 0 and packet_id_reply == packet_id:
-            return {"success": True, "rtt": rtt, "host": host, "ip": dest_addr}
-        else:
-            return {"success": False, "error": "Invalid ICMP reply received.", "host": host, "ip": dest_addr}
-    
-    except socket.timeout:
-        sock.close()
-        return {"success": False, "error": "Request timed out.", "host": host, "ip": dest_addr}
-    except Exception as e:
-        sock.close()
-        return {"success": False, "error": f"An error occurred: {e}", "host": host, "ip": dest_addr}
-# ---- PINGING CODE END ----
+import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -106,6 +28,8 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
+# New env var from previous code
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME") 
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
@@ -117,6 +41,7 @@ SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
 SET_CAPTION_REQUEST = set()
 USER_CAPTIONS = {}
+# New state for dynamic captions
 USER_COUNTERS = {}
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
@@ -164,12 +89,14 @@ def progress_keyboard():
 def delete_caption_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
 
+# ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
     pass
 
 def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
     pass
 
+# ---- robust download stream with retries ----
 async def download_stream(resp, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
     total = 0
     try:
@@ -260,7 +187,6 @@ async def set_bot_commands():
         BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
-        BotCommand("ping", "ডোমেইন/আইপি পিং করুন (admin only)"),
         BotCommand("help", "সহায়িকা")
     ]
     try:
@@ -285,7 +211,6 @@ async def start_handler(c, m: Message):
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
-        "/ping <hostname or IP> - ডোমেইন বা IP পিং করুন (admin only)\n"
         "/help - সাহায্য"
     )
     await m.reply_text(text)
@@ -352,14 +277,16 @@ async def photo_handler(c, m: Message):
     else:
         pass
 
+# New handlers for caption
 @app.on_message(filters.command("set_caption") & filters.private)
 async def set_caption_prompt(c, m: Message):
     if not is_admin(m.from_user.id):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     SET_CAPTION_REQUEST.add(m.from_user.id)
+    # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
-    await m.reply_text("ক্যাপশন দিন।")
+    await m.reply_text("ক্যাপশন দিন। কোড - [01 (+01, 01u)], [re (480p, 720p, 1080p)]")
 
 @app.on_message(filters.command("view_caption") & filters.private)
 async def view_caption_cmd(c, m: Message):
@@ -381,7 +308,7 @@ async def delete_caption_cb(c, cb):
         return
     if uid in USER_CAPTIONS:
         USER_CAPTIONS.pop(uid)
-        USER_COUNTERS.pop(uid, None)
+        USER_COUNTERS.pop(uid, None) # New: delete counter data
         await cb.message.edit_text("আপনার ক্যাপশন মুছে ফেলা হয়েছে।")
     else:
         await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
@@ -393,13 +320,15 @@ async def text_handler(c, m: Message):
     uid = m.from_user.id
     text = m.text.strip()
     
+    # Handle set caption request
     if uid in SET_CAPTION_REQUEST:
         SET_CAPTION_REQUEST.discard(uid)
         USER_CAPTIONS[uid] = text
-        USER_COUNTERS.pop(uid, None)
+        USER_COUNTERS.pop(uid, None) # New: reset counter on new caption set
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
 
+    # Handle auto URL upload
     if text.startswith("http://") or text.startswith("https://"):
         asyncio.create_task(handle_url_download_and_upload(c, m, text))
     
@@ -413,43 +342,6 @@ async def upload_url_cmd(c, m: Message):
         return
     url = m.text.split(None, 1)[1].strip()
     asyncio.create_task(handle_url_download_and_upload(c, m, url))
-
-# ---- NEW PING HANDLER ----
-@app.on_message(filters.command("ping") & filters.private)
-async def ping_cmd(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
-        return
-    
-    if len(m.command) < 2:
-        await m.reply_text("ব্যবহার: /ping <hostname or IP>\nউদাহরণ: /ping google.com")
-        return
-        
-    host = m.text.split(None, 1)[1].strip()
-    
-    status_msg = await m.reply_text(f"Pinging `{host}` with 4 packets...")
-    
-    replies = []
-    
-    # Send 4 ping requests in a loop
-    for i in range(4):
-        result = await ping_host(host)
-        replies.append(result)
-
-    success_count = sum(1 for r in replies if r['success'])
-    avg_rtt = sum(r['rtt'] for r in replies if r['success']) / success_count if success_count > 0 else 0
-    loss_rate = ((4 - success_count) / 4) * 100
-    
-    response_text = f"**Pinging {host}:**\n"
-    response_text += f"Packets: Sent = 4, Received = {success_count}, Lost = {4 - success_count} ({loss_rate:.0f}% loss)\n"
-    if success_count > 0:
-        response_text += f"Approximate round trip time in ms:\n"
-        response_text += f"Average = `{avg_rtt:.2f}`ms\n"
-    else:
-        response_text += "All requests timed out."
-        
-    await status_msg.edit_text(response_text)
-# ---- END NEW PING HANDLER ----
 
 async def handle_url_download_and_upload(c: Client, m: Message, url: str):
     uid = m.from_user.id
@@ -577,6 +469,7 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
+# ---- main processing and upload ----
 async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
     try:
         duration = get_video_duration(video_path)
@@ -633,11 +526,14 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         return False, str(e)
 
 def process_dynamic_caption(uid, caption_template):
+    # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
         USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}}
 
+    # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
+    # Episode Number Logic (e.g., [(01) (+1, 3u)])
     episode_matches = re.findall(r"\[\((\d+)\) \(\+(\d+), (\d+)u\)\]", caption_template)
     for match in episode_matches:
         original_placeholder = f"[({match[0]}) (+{match[1]}, {match[2]}u)]"
@@ -645,17 +541,21 @@ def process_dynamic_caption(uid, caption_template):
         increment_val = int(match[1])
         uploads_per_inc = int(match[2])
 
+        # Create a unique key for this specific episode code
         code_key = f"episode_{start_num}_{increment_val}_{uploads_per_inc}"
         if code_key not in USER_COUNTERS[uid]['episode_numbers']:
             USER_COUNTERS[uid]['episode_numbers'][code_key] = start_num
         
+        # Calculate the current episode number
         current_uploads = USER_COUNTERS[uid]['uploads']
         episode_number = start_num + ((current_uploads - 1) // uploads_per_inc) * increment_val
         
+        # Format the number with leading zeros if necessary
         formatted_episode_number = f"{episode_number:02d}"
 
         caption_template = caption_template.replace(original_placeholder, f"({formatted_episode_number})", 1)
 
+    # Episode Number Logic (e.g., [01 (+01, 3u)])
     episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
     for match in episode_matches_no_paren:
         original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
@@ -674,6 +574,8 @@ def process_dynamic_caption(uid, caption_template):
         
         caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
 
+
+    # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
     quality_match = re.search(r"\[re\s*\(.*?\)\]", caption_template)
     if quality_match:
         options_str = quality_match.group(0)
@@ -686,6 +588,7 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
     
     return "**" + "\n".join(caption_template.splitlines()) + "**"
+
 
 async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
     uid = m.from_user.id
@@ -794,6 +697,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         except Exception:
             pass
 
+# *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd_no_reply(c, m: Message):
     uid = m.from_user.id
@@ -832,13 +736,67 @@ async def broadcast_cmd_reply(c, m: Message):
 
     await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
 
-# Flask route to keep web service port open for Render
-@flask_app.route("/")
+# --- Flask Web Server ---
+@flask_app.route('/')
 def home():
-    return "Bot is running (Flask alive)."
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Bot Status</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f0f2f5;
+                color: #333;
+                text-align: center;
+                padding-top: 50px;
+            }
+            .container {
+                background-color: #fff;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                display: inline-block;
+            }
+            h1 {
+                color: #28a745;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>TA File Share Bot is running! ✅</h1>
+            <p>This page confirms that the bot's web server is active.</p>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html_content)
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+# Ping service to keep the bot alive
+def ping_service():
+    if not RENDER_EXTERNAL_HOSTNAME:
+        print("Render URL is not set. Ping service is disabled.")
+        return
+
+    url = f"http://{RENDER_EXTERNAL_HOSTNAME}"
+    while True:
+        try:
+            response = requests.get(url, timeout=10)
+            print(f"Pinged {url} | Status Code: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error pinging {url}: {e}")
+        time.sleep(600)
+
+def run_flask_and_ping():
+    flask_thread = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False))
+    flask_thread.start()
+    ping_thread = threading.Thread(target=ping_service)
+    ping_thread.start()
+    print("Flask and Ping services started.")
 
 async def periodic_cleanup():
     while True:
@@ -856,8 +814,8 @@ async def periodic_cleanup():
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    print("Bot চালু হচ্ছে... Flask thread start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
-    t = threading.Thread(target=run_flask, daemon=True)
+    print("Bot চালু হচ্ছে... Flask and Ping threads start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
+    t = threading.Thread(target=run_flask_and_ping, daemon=True)
     t.start()
     try:
         loop = asyncio.get_event_loop()
