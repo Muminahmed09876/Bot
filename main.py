@@ -427,20 +427,28 @@ async def ping_cmd(c, m: Message):
         
     host = m.text.split(None, 1)[1].strip()
     
-    status_msg = await m.reply_text(f"Pinging `{host}`...")
+    status_msg = await m.reply_text(f"Pinging `{host}` with 4 packets...")
     
-    result = await ping_host(host)
+    replies = []
     
-    if result["success"]:
-        await status_msg.edit_text(
-            f"**Reply from** `{result['ip']}`:\n"
-            f"Time: `{result['rtt']:.2f}`ms"
-        )
+    # Send 4 ping requests in a loop
+    for i in range(4):
+        result = await ping_host(host)
+        replies.append(result)
+
+    success_count = sum(1 for r in replies if r['success'])
+    avg_rtt = sum(r['rtt'] for r in replies if r['success']) / success_count if success_count > 0 else 0
+    loss_rate = ((4 - success_count) / 4) * 100
+    
+    response_text = f"**Pinging {host}:**\n"
+    response_text += f"Packets: Sent = 4, Received = {success_count}, Lost = {4 - success_count} ({loss_rate:.0f}% loss)\n"
+    if success_count > 0:
+        response_text += f"Approximate round trip time in ms:\n"
+        response_text += f"Average = `{avg_rtt:.2f}`ms\n"
     else:
-        await status_msg.edit_text(
-            f"**Pinging** `{result['host']}` **failed.**\n"
-            f"Error: `{result['error']}`"
-        )
+        response_text += "All requests timed out."
+        
+    await status_msg.edit_text(response_text)
 # ---- END NEW PING HANDLER ----
 
 async def handle_url_download_and_upload(c: Client, m: Message, url: str):
@@ -824,6 +832,7 @@ async def broadcast_cmd_reply(c, m: Message):
 
     await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
 
+# Flask route to keep web service port open for Render
 @flask_app.route("/")
 def home():
     return "Bot is running (Flask alive)."
