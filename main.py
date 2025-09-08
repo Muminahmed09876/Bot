@@ -15,7 +15,7 @@ from hachoir.metadata import extractMetadata
 import subprocess
 import traceback
 from flask import Flask, render_template_string
-import requests # Added requests for ping service
+import requests
 import time
 import math
 import logging
@@ -43,6 +43,10 @@ SET_CAPTION_REQUEST = set()
 USER_CAPTIONS = {}
 # New state for dynamic captions
 USER_COUNTERS = {}
+# New state for edit caption mode
+EDIT_CAPTION_MODE = set()
+USER_THUMB_TIME = {}
+
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 2 * 1024 * 1024 * 1024
@@ -82,6 +86,19 @@ def get_video_duration(file_path: Path) -> int:
     except Exception:
         return 0
     return 0
+
+def parse_time(time_str: str) -> int:
+    """Parses a time string like '5s', '1m', '1h 30s' into seconds."""
+    total_seconds = 0
+    parts = time_str.lower().split()
+    for part in parts:
+        if part.endswith('s'):
+            total_seconds += int(part[:-1])
+        elif part.endswith('m'):
+            total_seconds += int(part[:-1]) * 60
+        elif part.endswith('h'):
+            total_seconds += int(part[:-1]) * 3600
+    return total_seconds
 
 def progress_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_task")]])
@@ -185,6 +202,7 @@ async def set_bot_commands():
         BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
         BotCommand("set_caption", "কাস্টম ক্যাপশন সেট করুন (admin only)"),
         BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
+        BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট করুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
@@ -209,6 +227,7 @@ async def start_handler(c, m: Message):
         "/del_thumb - আপনার থাম্বনেইল মুছে ফেলুন (admin only)\n"
         "/set_caption - একটি ক্যাপশন সেট করুন (admin only)\n"
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
+        "/edit_caption_mode - শুধু ক্যাপশন এডিট করার মোড টগল করুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
@@ -224,8 +243,20 @@ async def setthumb_prompt(c, m):
     if not is_admin(m.from_user.id):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
-    SET_THUMB_REQUEST.add(m.from_user.id)
-    await m.reply_text("একটি ছবি পাঠান (photo) — সেট হবে আপনার থাম্বনেইল।")
+    
+    uid = m.from_user.id
+    if len(m.command) > 1:
+        time_str = " ".join(m.command[1:])
+        seconds = parse_time(time_str)
+        if seconds > 0:
+            USER_THUMB_TIME[uid] = seconds
+            await m.reply_text(f"থাম্বনেইল তৈরির সময় সেট হয়েছে: {seconds} সেকেন্ড।")
+        else:
+            await m.reply_text("সঠিক ফরম্যাটে সময় দিন। উদাহরণ: `/setthumb 5s`, `/setthumb 1m`, `/setthumb 1m 30s`")
+    else:
+        SET_THUMB_REQUEST.add(uid)
+        await m.reply_text("একটি ছবি পাঠান (photo) — সেট হবে আপনার থাম্বনেইল।")
+
 
 @app.on_message(filters.command("view_thumb") & filters.private)
 async def view_thumb_cmd(c, m: Message):
@@ -234,10 +265,14 @@ async def view_thumb_cmd(c, m: Message):
         return
     uid = m.from_user.id
     thumb_path = USER_THUMBS.get(uid)
+    thumb_time = USER_THUMB_TIME.get(uid)
+    
     if thumb_path and Path(thumb_path).exists():
         await c.send_photo(chat_id=m.chat.id, photo=thumb_path, caption="এটা আপনার সেভ করা থাম্বনেইল।")
+    elif thumb_time:
+        await m.reply_text(f"আপনার থাম্বনেইল তৈরির সময় সেট করা আছে: {thumb_time} সেকেন্ড।")
     else:
-        await m.reply_text("আপনার কোনো থাম্বনেইল সেভ করা নেই। /setthumb দিয়ে সেট করুন।")
+        await m.reply_text("আপনার কোনো থাম্বনেইল বা থাম্বনেইল তৈরির সময় সেভ করা নেই। /setthumb দিয়ে সেট করুন।")
 
 @app.on_message(filters.command("del_thumb") & filters.private)
 async def del_thumb_cmd(c, m: Message):
@@ -252,9 +287,15 @@ async def del_thumb_cmd(c, m: Message):
         except Exception:
             pass
         USER_THUMBS.pop(uid, None)
-        await m.reply_text("আপনার থাম্বনেইল মুছে ফেলা হয়েছে।")
-    else:
+    
+    if uid in USER_THUMB_TIME:
+        USER_THUMB_TIME.pop(uid)
+
+    if not (thumb_path or uid in USER_THUMB_TIME):
         await m.reply_text("আপনার কোনো থাম্বনেইল সেভ করা নেই।")
+    else:
+        await m.reply_text("আপনার থাম্বনেইল/থাম্বনেইল তৈরির সময় মুছে ফেলা হয়েছে।")
+
 
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(c, m: Message):
@@ -271,6 +312,8 @@ async def photo_handler(c, m: Message):
             img = img.convert("RGB")
             img.save(out, "JPEG")
             USER_THUMBS[uid] = str(out)
+            # Make sure to clear the time setting if a photo is set
+            USER_THUMB_TIME.pop(uid, None)
             await m.reply_text("আপনার থাম্বনেইল সেভ হয়েছে।")
         except Exception as e:
             await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
@@ -313,6 +356,22 @@ async def delete_caption_cb(c, cb):
     else:
         await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
 
+# New handler to toggle edit caption mode
+@app.on_message(filters.command("edit_caption_mode") & filters.private)
+async def toggle_edit_caption_mode(c, m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+
+    if uid in EDIT_CAPTION_MODE:
+        EDIT_CAPTION_MODE.discard(uid)
+        await m.reply_text("edit video caption mod off.\nএখন থেকে আপলোড করা ভিডিওর রিনেম ও থাম্বনেইল পরিবর্তন হবে, এবং সেভ করা ক্যাপশন যুক্ত হবে।")
+    else:
+        EDIT_CAPTION_MODE.add(uid)
+        await m.reply_text("edit video caption mod on.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
+
+
 @app.on_message(filters.text & filters.private)
 async def text_handler(c, m: Message):
     if not is_admin(m.from_user.id):
@@ -348,7 +407,10 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
 
-    status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    try:
+        status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
     try:
         fname = url.split("/")[-1].split("?")[0] or f"download_{int(datetime.now().timestamp())}"
         safe_name = re.sub(r"[\\/*?\"<>|:]", "_", fname)
@@ -359,11 +421,19 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
 
         tmp_in = TMP / f"dl_{uid}_{int(datetime.now().timestamp())}_{safe_name}"
         ok, err = False, None
+        
+        try:
+            await status_msg.edit("ডাউনলোড হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            status_msg = await m.reply_text("ডাউনলোড হচ্ছে...", reply_markup=progress_keyboard())
 
         if is_drive_url(url):
             fid = extract_drive_id(url)
             if not fid:
-                await status_msg.edit("Google Drive লিঙ্ক থেকে file id পাওয়া যায়নি। সঠিক লিংক দিন।", reply_markup=None)
+                try:
+                    await status_msg.edit("Google Drive লিঙ্ক থেকে file id পাওয়া যায়নি। সঠিক লিংক দিন।", reply_markup=None)
+                except Exception:
+                    await m.reply_text("Google Drive লিঙ্ক থেকে file id পাওয়া যায়নি। সঠিক লিংক দিন।", reply_markup=None)
                 TASKS[uid].remove(cancel_event)
                 return
             ok, err = await download_drive_file(fid, tmp_in, status_msg, cancel_event=cancel_event)
@@ -371,7 +441,10 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             ok, err = await download_url_generic(url, tmp_in, status_msg, cancel_event=cancel_event)
 
         if not ok:
-            await status_msg.edit(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
+            try:
+                await status_msg.edit(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
+            except Exception:
+                await m.reply_text(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
             try:
                 if tmp_in.exists():
                     tmp_in.unlink()
@@ -380,11 +453,106 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             TASKS[uid].remove(cancel_event)
             return
 
-        await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        try:
+            await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        except Exception:
+            await m.reply_text("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
         await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         traceback.print_exc()
-        await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
+        try:
+            await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
+        except Exception:
+            await m.reply_text(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
+    finally:
+        try:
+            TASKS[uid].remove(cancel_event)
+        except Exception:
+            pass
+
+async def handle_caption_only_upload(c: Client, m: Message):
+    uid = m.from_user.id
+    caption_to_use = USER_CAPTIONS.get(uid)
+    if not caption_to_use:
+        await m.reply_text("ক্যাপশন এডিট মোড চালু আছে কিন্তু কোনো সেভ করা ক্যাপশন নেই। /set_caption দিয়ে ক্যাপশন সেট করুন।")
+        return
+
+    cancel_event = asyncio.Event()
+    TASKS.setdefault(uid, []).append(cancel_event)
+    
+    try:
+        status_msg = await m.reply_text("ক্যাপশন এডিট করা হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("ক্যাপশন এডিট করা হচ্ছে...", reply_markup=progress_keyboard())
+    
+    try:
+        source_message = m
+        file_info = source_message.video or source_message.document
+
+        if not file_info:
+            try:
+                await status_msg.edit("এটি একটি ভিডিও বা ডকুমেন্ট ফাইল নয়।")
+            except Exception:
+                await m.reply_text("এটি একটি ভিডিও বা ডকুমেন্ট ফাইল নয়।")
+            return
+        
+        # Process the dynamic caption
+        final_caption = process_dynamic_caption(uid, caption_to_use)
+        
+        if file_info.file_id:
+            try:
+                if source_message.video:
+                    await c.send_video(
+                        chat_id=m.chat.id,
+                        video=file_info.file_id,
+                        caption=final_caption,
+                        thumb=file_info.thumbs[0].file_id if file_info.thumbs else None,
+                        duration=file_info.duration,
+                        supports_streaming=True,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                elif source_message.document:
+                    await c.send_document(
+                        chat_id=m.chat.id,
+                        document=file_info.file_id,
+                        file_name=file_info.file_name,
+                        caption=final_caption,
+                        thumb=file_info.thumbs[0].file_id if file_info.thumbs else None,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    await status_msg.edit(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
+                except Exception:
+                    await m.reply_text(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
+                return
+        else:
+            try:
+                await status_msg.edit("ফাইলের ফাইল আইডি পাওয়া যায়নি।", reply_markup=None)
+            except Exception:
+                await m.reply_text("ফাইলের ফাইল আইডি পাওয়া যায়নি।", reply_markup=None)
+            return
+        
+        # New code to auto-delete the success message
+        try:
+            success_msg = await status_msg.edit("ক্যাপশন সফলভাবে আপডেট করা হয়েছে।", reply_markup=None)
+            await asyncio.sleep(5)
+            await success_msg.delete()
+        except Exception:
+            success_msg = await m.reply_text("ক্যাপশন সফলভাবে আপডেট করা হয়েছে।", reply_markup=None)
+            await asyncio.sleep(5)
+            await success_msg.delete()
+
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            await status_msg.edit(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
+        except Exception:
+            await m.reply_text(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
     finally:
         try:
             TASKS[uid].remove(cancel_event)
@@ -396,6 +564,12 @@ async def forwarded_file_rename(c: Client, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         return
+    
+    # Check if the user is in edit caption mode
+    if uid in EDIT_CAPTION_MODE:
+        await handle_caption_only_upload(c, m)
+        return
+
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
@@ -406,11 +580,17 @@ async def forwarded_file_rename(c: Client, m: Message):
     else:
         original_name = file_info.file_name
 
-    status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    try:
+        status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
     tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
     try:
         await m.download(file_name=str(tmp_path))
-        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        try:
+            await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+        except Exception:
+            await m.reply_text("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
         await process_file_and_upload(c, m, tmp_path, original_name=original_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
@@ -438,11 +618,17 @@ async def rename_cmd(c, m: Message):
 
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
-    status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+    try:
+        status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
     tmp_out = TMP / f"rename_{uid}_{int(datetime.now().timestamp())}_{new_name}"
     try:
         await m.reply_to_message.download(file_name=str(tmp_out))
-        await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
+        try:
+            await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
+        except Exception:
+            await m.reply_text("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
         await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         await m.reply_text(f"রিনেম ত্রুটি: {e}")
@@ -470,15 +656,13 @@ async def cancel_task_cb(c, cb):
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
 # ---- main processing and upload ----
-async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
+async def generate_video_thumbnail(video_path: Path, thumb_path: Path, timestamp_sec: int = 1):
     try:
-        duration = get_video_duration(video_path)
-        timestamp = 1 if duration > 1 else 0
         cmd = [
             "ffmpeg",
             "-y",
             "-i", str(video_path),
-            "-ss", str(timestamp),
+            "-ss", str(timestamp_sec),
             "-vframes", "1",
             "-vf", "scale=320:-1",
             str(thumb_path)
@@ -489,9 +673,12 @@ async def generate_video_thumbnail(video_path: Path, thumb_path: Path):
         logger.warning("Thumbnail generate error: %s", e)
         return False
 
-async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
+async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
     try:
-        await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        try:
+            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            await m.reply_text("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
@@ -503,7 +690,10 @@ async def convert_to_mp4(in_path: Path, out_path: Path, status_msg: Message):
         
         if result.returncode != 0:
             logger.warning("Container conversion failed, attempting full re-encoding: %s", result.stderr)
-            await status_msg.edit("ভিডিওটি MP4 ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+            try:
+                await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+            except Exception:
+                await m.reply_text("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             cmd_full = [
                 "ffmpeg",
                 "-i", str(in_path),
@@ -601,34 +791,54 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 
     try:
         final_name = original_name or in_path.name
-        thumb_path = USER_THUMBS.get(uid)
 
-        is_video = in_path.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        is_video = in_path.suffix.lower() in video_exts
         
-        if is_video and in_path.suffix.lower() != ".mp4":
-            mp4_path = TMP / f"{in_path.stem}.mp4"
-            status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MP4 এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
-            if messages_to_delete:
-                messages_to_delete.append(status_msg.id)
-            ok, err = await convert_to_mp4(in_path, mp4_path, status_msg)
-            if not ok:
-                await status_msg.edit(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
+        if is_video:
+            if in_path.suffix.lower() == ".mp4":
+                final_name = "@TA_HD_Anime video.mp4"
+            elif in_path.suffix.lower() == ".mkv":
+                final_name = "@TA_HD_Anime video.mkv"
             else:
-                upload_path = mp4_path
-                final_name = f"{Path(final_name).stem}.mp4"
+                mkv_path = TMP / f"{in_path.stem}.mkv"
+                try:
+                    status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+                except Exception:
+                    status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+                if messages_to_delete:
+                    messages_to_delete.append(status_msg.id)
+                ok, err = await convert_to_mkv(in_path, mkv_path, status_msg)
+                if not ok:
+                    try:
+                        await status_msg.edit(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
+                    except Exception:
+                        await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
+                else:
+                    upload_path = mkv_path
+                    final_name = "@TA_HD_Anime video.mkv"
                 
+        thumb_path = USER_THUMBS.get(uid)
+        
         if is_video and not thumb_path:
             temp_thumb_path = TMP / f"thumb_{uid}_{int(datetime.now().timestamp())}.jpg"
-            ok = await generate_video_thumbnail(upload_path, temp_thumb_path)
+            thumb_time_sec = USER_THUMB_TIME.get(uid, 1) # Default to 1 second
+            ok = await generate_video_thumbnail(upload_path, temp_thumb_path, timestamp_sec=thumb_time_sec)
             if ok:
                 thumb_path = str(temp_thumb_path)
 
-        status_msg = await m.reply_text("আপলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        try:
+            status_msg = await m.reply_text("আপলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            status_msg = await m.reply_text("আপলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
         if messages_to_delete:
             messages_to_delete.append(status_msg.id)
 
         if cancel_event.is_set():
-            await status_msg.edit("অপারেশন বাতিল করা হয়েছে, আপলোড শুরু করা হয়নি।", reply_markup=None)
+            try:
+                await status_msg.edit("অপারেশন বাতিল করা হয়েছে, আপলোড শুরু করা হয়নি।", reply_markup=None)
+            except Exception:
+                await m.reply_text("অপারেশন বাতিল করা হয়েছে, আপলোড শুরু করা হয়নি।", reply_markup=None)
             TASKS[uid].remove(cancel_event)
             return
         
@@ -740,7 +950,7 @@ async def broadcast_cmd_reply(c, m: Message):
 @flask_app.route('/')
 def home():
     html_content = """
-    <!DOCTYPE html>
+    <!DOCTYPE-html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
