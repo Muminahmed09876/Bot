@@ -162,7 +162,7 @@ async def download_url_generic(url: str, out_path: Path, message: Message = None
         except Exception as e:
             return False, str(e)
 
-async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.2Event = None):
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
     timeout = aiohttp.ClientTimeout(total=7200)
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
@@ -673,12 +673,11 @@ async def generate_video_thumbnail(video_path: Path, thumb_path: Path, timestamp
         logger.warning("Thumbnail generate error: %s", e)
         return False
 
-async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
+# --- এখানে MKV কনভার্সন ফাংশনটি সংশোধন করা হয়েছে ---
+async def convert_to_mkv(in_path: Path, out_path: Path, m: Message):
     try:
-        try:
-            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
-        except Exception:
-            await m.reply_text("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        status_msg = await m.reply_text("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
@@ -690,10 +689,7 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         
         if result.returncode != 0:
             logger.warning("Container conversion failed, attempting full re-encoding: %s", result.stderr)
-            try:
-                await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
-            except Exception:
-                await m.reply_text("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             cmd_full = [
                 "ffmpeg",
                 "-i", str(in_path),
@@ -710,11 +706,17 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         if not out_path.exists() or out_path.stat().st_size == 0:
             raise Exception("Converted file not found or is empty.")
         
+        await status_msg.delete()
         return True, None
     except Exception as e:
         logger.error("Video conversion error: %s", e)
+        try:
+            await status_msg.edit(f"কনভার্সন ব্যর্থ: {e}", reply_markup=None)
+        except Exception:
+            pass
         return False, str(e)
 
+# --- এখানে process_dynamic_caption ফাংশনটি সংশোধন করা হয়েছে ---
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
@@ -765,7 +767,7 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
 
 
-    # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
+    # Quality Cycle Logic (e.g., [re (480p, 720p, 1080p)])
     quality_match = re.search(r"\[re\s*\(.*?\)\]", caption_template)
     if quality_match:
         options_str = quality_match.group(0)
@@ -778,10 +780,11 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
 
     # New: End of series/special episode logic
-    end_matches = re.findall(r"\[End \((\d+)\), (\d+)\)\]", caption_template)
+    end_matches = re.findall(r"\[End \((\d+[a-zA-Z]*), (\d+)\)\]", caption_template)
     for match in end_matches:
-        end_placeholder = f"[End ({match[0]}), {match[1]})]"
-        end_episode_num = int(match[0])
+        end_placeholder = f"[End ({match[0]}, {match[1]})]"
+        end_episode_num_str = re.sub(r'[^0-9]', '', match[0])
+        end_episode_num = int(end_episode_num_str) if end_episode_num_str else 0
         repeat_count = int(match[1])
 
         current_uploads = USER_COUNTERS[uid]['uploads']
@@ -806,31 +809,20 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     try:
         final_name = original_name or in_path.name
 
-        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ""}
         is_video = in_path.suffix.lower() in video_exts
         
         if is_video:
-            if in_path.suffix.lower() == ".mp4":
-                final_name = "@TA_HD_Anime video.mp4"
-            elif in_path.suffix.lower() == ".mkv":
-                final_name = "@TA_HD_Anime video.mkv"
-            else:
+            if in_path.suffix.lower() not in [".mp4", ".mkv"]:
                 mkv_path = TMP / f"{in_path.stem}.mkv"
-                try:
-                    status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
-                except Exception:
-                    status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
-                if messages_to_delete:
-                    messages_to_delete.append(status_msg.id)
-                ok, err = await convert_to_mkv(in_path, mkv_path, status_msg)
-                if not ok:
-                    try:
-                        await status_msg.edit(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
-                    except Exception:
-                        await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
-                else:
+                await m.reply_text("ফাইলে কোনো ফরম্যাট না থাকায় MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=None)
+                ok, err = await convert_to_mkv(in_path, mkv_path, m)
+                if ok:
                     upload_path = mkv_path
-                    final_name = "@TA_HD_Anime video.mkv"
+                else:
+                    await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
+            
+            final_name = f"@TA_HD_Anime video{upload_path.suffix.lower()}"
                 
         thumb_path = USER_THUMBS.get(uid)
         
