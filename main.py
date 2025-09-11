@@ -575,10 +575,12 @@ async def forwarded_file_rename(c: Client, m: Message):
     
     file_info = m.video or m.document
     
-    if not file_info or not file_info.file_name:
-        original_name = f"new_file_{int(datetime.now().timestamp())}.mp4"
-    else:
+    if file_info and file_info.file_name:
         original_name = file_info.file_name
+    elif m.video:
+        original_name = f"video_{file_info.file_unique_id}.mp4"
+    else:
+        original_name = f"file_{file_info.file_unique_id}"
 
     try:
         status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
@@ -806,16 +808,10 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 
     try:
         final_name = original_name or in_path.name
-
-        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
-        is_video = in_path.suffix.lower() in video_exts
+        is_video = bool(m.video)
         
         if is_video:
-            if in_path.suffix.lower() == ".mp4":
-                final_name = "@TA_HD_Anime video.mp4"
-            elif in_path.suffix.lower() == ".mkv":
-                final_name = "@TA_HD_Anime video.mkv"
-            else:
+            if in_path.suffix.lower() not in {".mp4", ".mkv"}:
                 mkv_path = TMP / f"{in_path.stem}.mkv"
                 try:
                     status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
@@ -831,8 +827,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
                 else:
                     upload_path = mkv_path
-                    final_name = "@TA_HD_Anime video.mkv"
-                
+        
         thumb_path = USER_THUMBS.get(uid)
         
         if is_video and not thumb_path:
