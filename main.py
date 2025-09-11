@@ -723,7 +723,7 @@ def process_dynamic_caption(uid, caption_template):
     # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
-    # Episode Number Logic (e.g., [(01) (+1, 3u)])
+    # Episode Number Logic (e.g., [(01) (+01, 01u)])
     episode_matches = re.findall(r"\[\((\d+)\) \(\+(\d+), (\d+)u\)\]", caption_template)
     for match in episode_matches:
         original_placeholder = f"[({match[0]}) (+{match[1]}, {match[2]}u)]"
@@ -776,6 +776,20 @@ def process_dynamic_caption(uid, caption_template):
         current_quality = options[current_index]
         
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
+
+    # New: End of series/special episode logic
+    end_matches = re.findall(r"\[End \((\d+)\), (\d+)\)\]", caption_template)
+    for match in end_matches:
+        end_placeholder = f"[End ({match[0]}), {match[1]})]"
+        end_episode_num = int(match[0])
+        repeat_count = int(match[1])
+
+        current_uploads = USER_COUNTERS[uid]['uploads']
+
+        if current_uploads >= end_episode_num and current_uploads < end_episode_num + repeat_count:
+            caption_template = caption_template.replace(end_placeholder, "End")
+        else:
+            caption_template = caption_template.replace(end_placeholder, "")
     
     return "**" + "\n".join(caption_template.splitlines()) + "**"
 
