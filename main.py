@@ -49,7 +49,7 @@ USER_THUMB_TIME = {}
 
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-MAX_SIZE = 2 * 1024 * 1024 * 1024
+MAX_SIZE = 4 * 1024 * 1024 * 1024
 
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
