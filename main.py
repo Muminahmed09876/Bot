@@ -46,6 +46,11 @@ USER_COUNTERS = {}
 # New state for edit caption mode
 EDIT_CAPTION_MODE = set()
 USER_THUMB_TIME = {}
+# New states for multiple quality upload feature
+MULT_QUALITY_REQUEST = set()
+MULT_QUALITY_OPTIONS = {} # {user_id: 2|3|4}
+QUALITY_FACTOR_REQUEST = set()
+user_quality_factors = {} # {user_id: [factor1, factor2, ...]}
 
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
@@ -105,6 +110,13 @@ def progress_keyboard():
 
 def delete_caption_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
+
+def mult_quality_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("2 quality", callback_data="mult_quality_2")],
+        [InlineKeyboardButton("3 quality", callback_data="mult_quality_3")],
+        [InlineKeyboardButton("4 quality", callback_data="mult_quality_4")]
+    ])
 
 # ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
@@ -204,6 +216,7 @@ async def set_bot_commands():
         BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
         BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট করুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
+        BotCommand("multiquality", "একাধিক কোয়ালিটি আপলোড মোড টগল করুন (admin only)"),
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -229,6 +242,7 @@ async def start_handler(c, m: Message):
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/edit_caption_mode - শুধু ক্যাপশন এডিট করার মোড টগল করুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/multiquality - একাধিক কোয়ালিটি আপলোড মোড টগল করুন (admin only)\n"
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
@@ -371,6 +385,36 @@ async def toggle_edit_caption_mode(c, m: Message):
         EDIT_CAPTION_MODE.add(uid)
         await m.reply_text("edit video caption mod on.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
 
+# New handler for multiple quality upload mode
+@app.on_message(filters.command("multiquality") & filters.private)
+async def mult_quality_prompt(c, m: Message):
+    if not is_admin(m.from_user.id):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+    
+    uid = m.from_user.id
+    if uid in MULT_QUALITY_REQUEST:
+        MULT_QUALITY_REQUEST.discard(uid)
+        MULT_QUALITY_OPTIONS.pop(uid, None)
+        QUALITY_FACTOR_REQUEST.discard(uid)
+        user_quality_factors.pop(uid, None)
+        await m.reply_text("একাধিক কোয়ালিটি আপলোড মোড বন্ধ করা হয়েছে।")
+    else:
+        MULT_QUALITY_REQUEST.add(uid)
+        await m.reply_text("একাধিক কোয়ালিটি আপলোড মোড চালু হয়েছে। আপনি কতগুলি কোয়ালিটি আপলোড করতে চান, তা বেছে নিন।", reply_markup=mult_quality_keyboard())
+
+@app.on_callback_query(filters.regex("mult_quality_"))
+async def mult_quality_cb(c, cb):
+    uid = cb.from_user.id
+    if not is_admin(uid):
+        await cb.answer("আপনার অনুমতি নেই।", show_alert=True)
+        return
+    
+    quality_count = int(cb.data.split('_')[-1])
+    MULT_QUALITY_OPTIONS[uid] = quality_count
+    QUALITY_FACTOR_REQUEST.add(uid)
+    
+    await cb.message.edit_text(f"{quality_count}টি কোয়ালিটি আপলোড হবে।\n\nএবার কোয়ালিটি ফ্যাক্টর দিন। যেমন: `2, 5` (যদি {quality_count}টি কোয়ালিটি চান, তবে {quality_count-1}টি ফ্যাক্টর দিন।)")
 
 @app.on_message(filters.text & filters.private)
 async def text_handler(c, m: Message):
@@ -386,6 +430,21 @@ async def text_handler(c, m: Message):
         USER_COUNTERS.pop(uid, None) # New: reset counter on new caption set
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
+
+    # Handle quality factor input
+    if uid in QUALITY_FACTOR_REQUEST:
+        try:
+            factors = [float(f.strip()) for f in text.split(',')]
+            if len(factors) != MULT_QUALITY_OPTIONS.get(uid, 0) - 1:
+                await m.reply_text(f"আপনার {MULT_QUALITY_OPTIONS.get(uid, 0)}টি কোয়ালিটি বেছেছেন। দয়া করে ঠিক {MULT_QUALITY_OPTIONS.get(uid, 0) - 1}টি ফ্যাক্টর দিন।")
+                return
+            user_quality_factors[uid] = factors
+            QUALITY_FACTOR_REQUEST.discard(uid)
+            await m.reply_text("কোয়ালিটি ফ্যাক্টর সেভ করা হয়েছে। এখন ভিডিও আপলোড করার জন্য একটি URL দিন।")
+            return
+        except ValueError:
+            await m.reply_text("সঠিক ফরম্যাটে কোয়ালিটি ফ্যাক্টর দিন। যেমন: `2, 5`")
+            return
 
     # Handle auto URL upload
     if text.startswith("http://") or text.startswith("https://"):
@@ -453,11 +512,14 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             TASKS[uid].remove(cancel_event)
             return
 
-        try:
-            await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        except Exception:
-            await m.reply_text("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
+        if uid in MULT_QUALITY_REQUEST and uid in user_quality_factors:
+            await process_and_upload_multiple_qualities(c, m, tmp_in, original_name=safe_name, status_msg=status_msg)
+        else:
+            try:
+                await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            except Exception:
+                await m.reply_text("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
     except Exception as e:
         traceback.print_exc()
         try:
@@ -569,6 +631,11 @@ async def forwarded_file_rename(c: Client, m: Message):
     if uid in EDIT_CAPTION_MODE:
         await handle_caption_only_upload(c, m)
         return
+    
+    # Check if the user is in mult quality mode
+    if uid in MULT_QUALITY_REQUEST and uid in user_quality_factors:
+        await m.reply_text("দুঃখিত, ফরওয়ার্ড করা ফাইল মাল্টি-কোয়ালিটি আপলোডের জন্য সমর্থিত নয়।")
+        return
 
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -614,6 +681,12 @@ async def rename_cmd(c, m: Message):
     if len(m.command) < 2:
         await m.reply_text("নতুন ফাইল নাম দিন। উদাহরণ: /rename new_video.mp4")
         return
+    
+    # Check if the user is in mult quality mode
+    if uid in MULT_QUALITY_REQUEST and uid in user_quality_factors:
+        await m.reply_text("দুঃখিত, রিনেম কমান্ডটি মাল্টি-কোয়ালিটি আপলোড মোডে কাজ করবে না।")
+        return
+
     new_name = m.text.split(None, 1)[1].strip()
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
     await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
@@ -717,6 +790,54 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         logger.error("Video conversion error: %s", e)
         return False, str(e)
 
+async def convert_video_with_crf(in_path: Path, out_path: Path, target_size_mb: float, duration_sec: int, status_msg: Message):
+    try:
+        if duration_sec == 0:
+            return False, "ভিডিওর ডিউরেশন পাওয়া যায়নি।"
+
+        # Calculate target bitrate in kbps
+        target_bitrate_kbps = (target_size_mb * 8192) / duration_sec
+        logger.info(f"Target size: {target_size_mb} MB, duration: {duration_sec} sec, bitrate: {target_bitrate_kbps} kbps")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", str(in_path),
+            "-c:v", "libx264",
+            "-b:v", f"{target_bitrate_kbps}k",
+            "-c:a", "copy",
+            "-preset", "slow",
+            "-maxrate", f"{target_bitrate_kbps*1.1}k",
+            "-bufsize", f"{target_bitrate_kbps*2}k",
+            str(out_path)
+        ]
+        
+        try:
+            await status_msg.edit(f"{out_path.name} ভিডিওটি এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            pass
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8', errors='ignore')
+            logger.error(f"FFmpeg error: {error_msg}")
+            return False, f"ভিডিও এনকোডিং ব্যর্থ: {error_msg}"
+        
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            return False, "এনকোড করা ফাইল পাওয়া যায়নি বা এটি খালি।"
+            
+        return True, None
+    except Exception as e:
+        logger.error(f"Video encoding error: {e}")
+        return False, str(e)
+
+
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
@@ -796,7 +917,123 @@ def process_dynamic_caption(uid, caption_template):
     
     return "**" + "\n".join(caption_template.splitlines()) + "**"
 
+async def process_and_upload_multiple_qualities(c: Client, m: Message, in_path: Path, original_name: str = None, status_msg: Message = None):
+    uid = m.from_user.id
+    cancel_event = asyncio.Event()
+    TASKS.setdefault(uid, []).append(cancel_event)
 
+    try:
+        await status_msg.edit("ভিডিওটি প্রসেস করা হচ্ছে একাধিক কোয়ালিটি আপলোডের জন্য...", reply_markup=progress_keyboard())
+        
+        original_size_mb = in_path.stat().st_size / (1024 * 1024)
+        duration_sec = get_video_duration(in_path)
+        
+        if duration_sec == 0:
+            await status_msg.edit("ভিডিওর ডিউরেশন পাওয়া যায়নি। একাধিক কোয়ালিটি আপলোড করা সম্ভব নয়।")
+            in_path.unlink()
+            return
+        
+        factors = user_quality_factors.get(uid, [])
+        num_qualities = MULT_QUALITY_OPTIONS.get(uid, 0)
+        
+        # Determine the number of low quality videos to upload
+        low_qualities_to_upload = num_qualities - 1
+        
+        # Ensure we have enough factors
+        if len(factors) < low_qualities_to_upload:
+            await status_msg.edit(f"দুঃখিত, {low_qualities_to_upload}টি কোয়ালিটির জন্য {len(factors)}টি ফ্যাক্টর দেওয়া হয়েছে।")
+            return
+            
+        uploads = []
+        
+        # Generate and upload low quality versions
+        for i in range(low_qualities_to_upload):
+            if cancel_event.is_set():
+                break
+            
+            factor = factors[i]
+            target_size_mb = original_size_mb / factor
+            
+            # Ensure target size is not too small
+            if target_size_mb < 2:
+                target_size_mb = 2.0
+            
+            output_name = f"{in_path.stem}_low_q{i+1}.mp4"
+            out_path = TMP / output_name
+            
+            ok, err = await convert_video_with_crf(in_path, out_path, target_size_mb, duration_sec, status_msg)
+            
+            if ok:
+                await status_msg.edit(f"কম কোয়ালিটির ভিডিও ({i+1}/{low_qualities_to_upload}) আপলোড হচ্ছে...")
+                
+                thumb_path = USER_THUMBS.get(uid)
+                if not thumb_path:
+                    temp_thumb_path = TMP / f"thumb_{uid}_low_q_{int(datetime.now().timestamp())}.jpg"
+                    thumb_time_sec = USER_THUMB_TIME.get(uid, 1)
+                    if await generate_video_thumbnail(out_path, temp_thumb_path, timestamp_sec=thumb_time_sec):
+                        thumb_path = str(temp_thumb_path)
+                
+                caption_to_use = USER_CAPTIONS.get(uid, out_path.name)
+                final_caption = process_dynamic_caption(uid, caption_to_use)
+                
+                await c.send_video(
+                    chat_id=m.chat.id,
+                    video=str(out_path),
+                    caption=final_caption,
+                    thumb=thumb_path,
+                    duration=get_video_duration(out_path),
+                    supports_streaming=True,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                uploads.append(out_path)
+                if thumb_path and Path(thumb_path).stem.startswith("thumb_"):
+                    Path(thumb_path).unlink(missing_ok=True)
+            else:
+                await status_msg.edit(f"কম কোয়ালিটির ভিডিও ({i+1}/{low_qualities_to_upload}) এনকোডিং ব্যর্থ: {err}")
+        
+        if not cancel_event.is_set():
+            # Upload original file
+            final_caption = process_dynamic_caption(uid, USER_CAPTIONS.get(uid, original_name))
+            
+            thumb_path = USER_THUMBS.get(uid)
+            if not thumb_path:
+                temp_thumb_path = TMP / f"thumb_{uid}_orig_{int(datetime.now().timestamp())}.jpg"
+                thumb_time_sec = USER_THUMB_TIME.get(uid, 1)
+                if await generate_video_thumbnail(in_path, temp_thumb_path, timestamp_sec=thumb_time_sec):
+                    thumb_path = str(temp_thumb_path)
+
+            await status_msg.edit("আসল ভিডিও আপলোড হচ্ছে...")
+            
+            await c.send_video(
+                chat_id=m.chat.id,
+                video=str(in_path),
+                caption=final_caption,
+                thumb=thumb_path,
+                duration=duration_sec,
+                supports_streaming=True,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            uploads.append(in_path)
+            if thumb_path and Path(thumb_path).stem.startswith("thumb_"):
+                Path(thumb_path).unlink(missing_ok=True)
+                
+        await status_msg.delete()
+        
+    except Exception as e:
+        await m.reply_text(f"একাধিক কোয়ালিটি আপলোডে ত্রুটি: {e}")
+        traceback.print_exc()
+    finally:
+        for f in uploads:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            in_path.unlink(missing_ok=True)
+            TASKS[uid].remove(cancel_event)
+        except Exception:
+            pass
+    
 async def process_file_and_upload(c: Client, m: Message, in_path: Path, original_name: str = None, messages_to_delete: list = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
