@@ -329,7 +329,7 @@ async def set_caption_prompt(c, m: Message):
     SET_CAPTION_REQUEST.add(m.from_user.id)
     # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
-    await m.reply_text("ক্যাপশন দিন। কোড - [01 (+01, 01u)], [re (480p, 720p, 1080p)]")
+    await m.reply_text("ক্যাপশন দিন। কোড - [01 (+01, 3u)], [re (480p, 720p, 1080p)]")
 
 @app.on_message(filters.command("view_caption") & filters.private)
 async def view_caption_cmd(c, m: Message):
@@ -808,7 +808,10 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 
     try:
         final_name = original_name or in_path.name
-        is_video = bool(m.video)
+        
+        # সংশোধিত লাইন: Pyrogram-এর ডিটেকশন ব্যর্থ হলেও ফাইলের এক্সটেনশন দেখে ভিডিও হিসেবে চিহ্নিত করবে।
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        is_video = bool(m.video) or any(in_path.suffix.lower() == ext for ext in video_exts)
         
         if is_video:
             if in_path.suffix.lower() not in {".mp4", ".mkv"}:
