@@ -720,34 +720,52 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
     if uid not in USER_COUNTERS:
-        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}}
+        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}, 'dynamic_counters': {}, 're_options_count': 0}
 
     # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
-    # Episode Number Logic (e.g., [(01) (+1, 3u)])
-    episode_matches = re.findall(r"\[\((\d+)\) \(\+(\d+), (\d+)u\)\]", caption_template)
-    for match in episode_matches:
-        original_placeholder = f"[({match[0]}) (+{match[1]}, {match[2]}u)]"
-        start_num = int(match[0])
-        increment_val = int(match[1])
-        uploads_per_inc = int(match[2])
-
-        # Create a unique key for this specific episode code
-        code_key = f"episode_{start_num}_{increment_val}_{uploads_per_inc}"
-        if code_key not in USER_COUNTERS[uid]['episode_numbers']:
-            USER_COUNTERS[uid]['episode_numbers'][code_key] = start_num
+    # Quality Cycle Logic (e.g., [re (480p, 720p, 1080p)])
+    quality_match = re.search(r"\[re\s*\((.*?)\)\]", caption_template)
+    if quality_match:
+        options_str = quality_match.group(1)
+        options = [opt.strip() for opt in options_str.split(',')]
         
-        # Calculate the current episode number
-        current_uploads = USER_COUNTERS[uid]['uploads']
-        episode_number = start_num + ((current_uploads - 1) // uploads_per_inc) * increment_val
+        # Store the number of options if not already stored
+        if not USER_COUNTERS[uid]['re_options_count']:
+            USER_COUNTERS[uid]['re_options_count'] = len(options)
         
-        # Format the number with leading zeros if necessary
-        formatted_episode_number = f"{episode_number:02d}"
+        # Calculate the current index in the cycle
+        current_index = (USER_COUNTERS[uid]['uploads'] - 1) % len(options)
+        current_quality = options[current_index]
+        
+        # Replace the placeholder with the current quality
+        caption_template = caption_template.replace(quality_match.group(0), current_quality)
 
-        caption_template = caption_template.replace(original_placeholder, f"({formatted_episode_number})", 1)
+        # Check if a full cycle has completed and increment counters
+        if (USER_COUNTERS[uid]['uploads'] - 1) % USER_COUNTERS[uid]['re_options_count'] == 0:
+            # Increment all dynamic counters
+            for key in USER_COUNTERS[uid]['dynamic_counters']:
+                USER_COUNTERS[uid]['dynamic_counters'][key] += 1
+    
+    # New: Main counter logic (e.g., [12], [(21)])
+    # Find all number-based placeholders
+    counter_matches = re.findall(r"\[\s*(\(?\d+\)?)\s*\]", caption_template)
+    
+    # Initialize counters on the first upload
+    if USER_COUNTERS[uid]['uploads'] == 1:
+        for match in counter_matches:
+            # Clean the number to use as a key
+            clean_match = re.sub(r'[()]', '', match)
+            USER_COUNTERS[uid]['dynamic_counters'][match] = int(clean_match)
 
-    # Episode Number Logic (e.g., [01 (+01, 3u)])
+    # Replace placeholders with their current values
+    for match, value in USER_COUNTERS[uid]['dynamic_counters'].items():
+        # This regex will replace all occurrences of the specific placeholder, e.g., '[12]' or '[(21)]'
+        caption_template = re.sub(re.escape(f"[{match}]"), str(value), caption_template)
+
+
+    # Old: Episode Number Logic (e.g., [01 (+01, 3u)]) - Kept for compatibility
     episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
     for match in episode_matches_no_paren:
         original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
@@ -766,20 +784,7 @@ def process_dynamic_caption(uid, caption_template):
         
         caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
 
-
-    # Quality Cycle Logic (e.g., [re (480p), (720p), (1080p)])
-    quality_match = re.search(r"\[re\s*\(.*?\)\]", caption_template)
-    if quality_match:
-        options_str = quality_match.group(0)
-        options_list_str = options_str[options_str.find("(") + 1:options_str.rfind(")")]
-        options = [opt.strip().strip("()") for opt in options_list_str.split(',')]
-        
-        current_index = (USER_COUNTERS[uid]['uploads'] - 1) % len(options)
-        current_quality = options[current_index]
-        
-        caption_template = caption_template.replace(quality_match.group(0), current_quality)
-
-    # New: End of series/special episode logic
+    # Old: End of series/special episode logic - Kept for compatibility
     end_matches = re.findall(r"\[End \((\d+[a-zA-Z]*), (\d+)\)\]", caption_template)
     for match in end_matches:
         end_placeholder = f"[End ({match[0]}, {match[1]})]"
