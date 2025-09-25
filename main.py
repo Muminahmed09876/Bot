@@ -329,7 +329,7 @@ async def set_caption_prompt(c, m: Message):
     SET_CAPTION_REQUEST.add(m.from_user.id)
     # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
-    await m.reply_text("ক্যাপশন দিন। কোড - [01 (+01, 3u)], [re (480p, 720p, 1080p)]")
+    await m.reply_text("ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন: `[01]`, `[(01)]` (নম্বর স্বয়ংক্রিয়ভাবে বাড়বে), `[re (480p, 720p)]` (গুণমানের সাইকেল), এবং `[End (10, 5)]` (নির্দিষ্ট পর্বের পর)।")
 
 @app.on_message(filters.command("view_caption") & filters.private)
 async def view_caption_cmd(c, m: Message):
@@ -746,7 +746,7 @@ def process_dynamic_caption(uid, caption_template):
         if (USER_COUNTERS[uid]['uploads'] - 1) % USER_COUNTERS[uid]['re_options_count'] == 0:
             # Increment all dynamic counters
             for key in USER_COUNTERS[uid]['dynamic_counters']:
-                USER_COUNTERS[uid]['dynamic_counters'][key] += 1
+                USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
     
     # New: Main counter logic (e.g., [12], [(21)])
     # Find all number-based placeholders
@@ -755,14 +755,26 @@ def process_dynamic_caption(uid, caption_template):
     # Initialize counters on the first upload
     if USER_COUNTERS[uid]['uploads'] == 1:
         for match in counter_matches:
+            # Check if the number has parentheses
+            has_paren = match.startswith('(') and match.endswith(')')
             # Clean the number to use as a key
             clean_match = re.sub(r'[()]', '', match)
-            USER_COUNTERS[uid]['dynamic_counters'][match] = int(clean_match)
+            # Store the original format and the starting value
+            USER_COUNTERS[uid]['dynamic_counters'][match] = {'value': int(clean_match), 'has_paren': has_paren}
 
     # Replace placeholders with their current values
-    for match, value in USER_COUNTERS[uid]['dynamic_counters'].items():
+    for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
+        value = data['value']
+        has_paren = data['has_paren']
+        
+        # Format the number with leading zeros if necessary
+        formatted_value = f"{value:02d}"
+
+        # Add parentheses back if they existed
+        final_value = f"({formatted_value})" if has_paren else formatted_value
+        
         # This regex will replace all occurrences of the specific placeholder, e.g., '[12]' or '[(21)]'
-        caption_template = re.sub(re.escape(f"[{match}]"), str(value), caption_template)
+        caption_template = re.sub(re.escape(f"[{match}]"), final_value, caption_template)
 
 
     # Old: Episode Number Logic (e.g., [01 (+01, 3u)]) - Kept for compatibility
