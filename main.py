@@ -330,12 +330,12 @@ async def set_caption_prompt(c, m: Message):
     # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
     
-    # *** Updated Caption Message ***
+    # *** Updated Caption Message as requested ***
     await m.reply_text(
         "ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন:\n"
         "1. **নম্বর বৃদ্ধি:** `[01]`, `[(01)]` (নম্বর স্বয়ংক্রিয়ভাবে বাড়বে)\n"
         "2. **গুণমানের সাইকেল:** `[re (480p, 720p)]`\n"
-        "3. **শর্তসাপেক্ষ টেক্সট (নতুন):** `[TEXT (XX)]` - যেমন: `[End (02)]`, `[hi (05)]` (যদি বর্তমান পর্বের নম্বর `XX` হয় বা তার চেয়ে কম হয়, তাহলে `TEXT` যোগ হবে)।"
+        "3. **শর্তসাপেক্ষ টেক্সট (নতুন):** `[TEXT (XX)]` - যেমন: `[End (02)]`, `[hi (05)]` (যদি বর্তমান পর্বের নম্বর `XX` এর **সমান** হয়, তাহলে `TEXT` যোগ হবে)।"
     )
 
 @app.on_message(filters.command("view_caption") & filters.private)
@@ -785,12 +785,10 @@ def process_dynamic_caption(uid, caption_template):
 
 
     # --- 3. New Conditional Text Logic (e.g., [End (02)], [hi (05)]) ---
-    # We need to determine the 'current episode number' from the dynamic counters.
-    # We will assume the smallest starting number counter (e.g. from [01]) represents the episode number.
     
-    # Find the current episode number
+    # Find the current episode number. We assume the smallest starting number counter 
+    # (e.g. from [01]) represents the episode number.
     current_episode_num = 0
-    # Find the smallest starting number from all dynamic counters to use as episode number
     for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
         if not current_episode_num or data['value'] < current_episode_num:
             current_episode_num = data['value']
@@ -813,27 +811,17 @@ def process_dynamic_caption(uid, caption_template):
             caption_template = caption_template.replace(placeholder, "")
             continue
         
-        # Apply the new logic: show TEXT if current_episode_num <= target_num
-        if current_episode_num <= target_num:
+        # *** FIX: New logic - show TEXT only if current_episode_num IS EQUAL TO target_num ***
+        if current_episode_num == target_num:
             # Replace placeholder with the actual TEXT
             caption_template = caption_template.replace(placeholder, text_to_add)
         else:
             # Replace placeholder with an empty string
             caption_template = caption_template.replace(placeholder, "")
 
+
     # --- 4. Old Episode Number Logic (Removed for simplicity and conflict avoidance) ---
-    # The old logic [01 (+01, 3u)] is highly complex and often conflicts with [re] and the new logic.
-    # Since the new [01]/[(01)] is now the primary episode counter, we can remove the old logic for a cleaner,
-    # less error-prone system.
     
-    # Old logic for [01 (+01, 3u)] is commented out to prevent conflict.
-    # episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
-    # for match in episode_matches_no_paren:
-    #     original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
-    #     caption_template = caption_template.replace(original_placeholder, "", 1) # Simply remove it
-
-    # Old logic for [End (XX, YY)] is removed as per user request to simplify.
-
     # Final formatting
     return "**" + "\n".join(caption_template.splitlines()) + "**"
 
