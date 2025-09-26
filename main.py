@@ -329,7 +329,14 @@ async def set_caption_prompt(c, m: Message):
     SET_CAPTION_REQUEST.add(m.from_user.id)
     # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
-    await m.reply_text("ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন: `[01]`, `[(01)]` (নম্বর স্বয়ংক্রিয়ভাবে বাড়বে), `[re (480p, 720p)]` (গুণমানের সাইকেল), এবং `[End (10, 5)]` (নির্দিষ্ট পর্বের পর)।")
+    
+    # *** Updated Caption Message ***
+    await m.reply_text(
+        "ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন:\n"
+        "1. **নম্বর বৃদ্ধি:** `[01]`, `[(01)]` (নম্বর স্বয়ংক্রিয়ভাবে বাড়বে)\n"
+        "2. **গুণমানের সাইকেল:** `[re (480p, 720p)]`\n"
+        "3. **শর্তসাপেক্ষ টেক্সট (নতুন):** `[TEXT (XX)]` - যেমন: `[End (02)]`, `[hi (05)]` (যদি বর্তমান পর্বের নম্বর `XX` হয় বা তার চেয়ে কম হয়, তাহলে `TEXT` যোগ হবে)।"
+    )
 
 @app.on_message(filters.command("view_caption") & filters.private)
 async def view_caption_cmd(c, m: Message):
@@ -714,7 +721,7 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         
         return True, None
     except Exception as e:
-        logger.error("Video conversion error: %s", e)
+        logger.error("Video conversion error: {e}")
         return False, str(e)
 
 def process_dynamic_caption(uid, caption_template):
@@ -725,7 +732,7 @@ def process_dynamic_caption(uid, caption_template):
     # Increment upload counter for the current user
     USER_COUNTERS[uid]['uploads'] += 1
 
-    # Quality Cycle Logic (e.g., [re (480p, 720p, 1080p)])
+    # --- 1. Quality Cycle Logic (e.g., [re (480p, 720p, 1080p)]) ---
     quality_match = re.search(r"\[re\s*\((.*?)\)\]", caption_template)
     if quality_match:
         options_str = quality_match.group(1)
@@ -748,7 +755,7 @@ def process_dynamic_caption(uid, caption_template):
             for key in USER_COUNTERS[uid]['dynamic_counters']:
                 USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
     
-    # New: Main counter logic (e.g., [12], [(21)])
+    # --- 2. Main counter logic (e.g., [12], [(21)]) ---
     # Find all number-based placeholders
     counter_matches = re.findall(r"\[\s*(\(?\d+\)?)\s*\]", caption_template)
     
@@ -767,7 +774,7 @@ def process_dynamic_caption(uid, caption_template):
         value = data['value']
         has_paren = data['has_paren']
         
-        # Format the number with leading zeros if necessary
+        # Format the number with leading zeros if necessary (02, 03, etc.)
         formatted_value = f"{value:02d}"
 
         # Add parentheses back if they existed
@@ -777,40 +784,57 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = re.sub(re.escape(f"[{match}]"), final_value, caption_template)
 
 
-    # Old: Episode Number Logic (e.g., [01 (+01, 3u)]) - Kept for compatibility
-    episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
-    for match in episode_matches_no_paren:
-        original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
-        start_num = int(match[0])
-        increment_val = int(match[1])
-        uploads_per_inc = int(match[2])
-        
-        code_key = f"episode_{start_num}_{increment_val}_{uploads_per_inc}"
-        if code_key not in USER_COUNTERS[uid]['episode_numbers']:
-            USER_COUNTERS[uid]['episode_numbers'][code_key] = start_num
-        
-        current_uploads = USER_COUNTERS[uid]['uploads']
-        episode_number = start_num + ((current_uploads - 1) // uploads_per_inc) * increment_val
-        
-        formatted_episode_number = f"{episode_number:02d}"
-        
-        caption_template = caption_template.replace(original_placeholder, formatted_episode_number, 1)
-
-    # Old: End of series/special episode logic - Kept for compatibility
-    end_matches = re.findall(r"\[End \((\d+[a-zA-Z]*), (\d+)\)\]", caption_template)
-    for match in end_matches:
-        end_placeholder = f"[End ({match[0]}, {match[1]})]"
-        end_episode_num_str = re.sub(r'[^0-9]', '', match[0])
-        end_episode_num = int(end_episode_num_str) if end_episode_num_str else 0
-        repeat_count = int(match[1])
-
-        current_uploads = USER_COUNTERS[uid]['uploads']
-
-        if current_uploads >= end_episode_num and current_uploads < end_episode_num + repeat_count:
-            caption_template = caption_template.replace(end_placeholder, "End")
-        else:
-            caption_template = caption_template.replace(end_placeholder, "")
+    # --- 3. New Conditional Text Logic (e.g., [End (02)], [hi (05)]) ---
+    # We need to determine the 'current episode number' from the dynamic counters.
+    # We will assume the smallest starting number counter (e.g. from [01]) represents the episode number.
     
+    # Find the current episode number
+    current_episode_num = 0
+    # Find the smallest starting number from all dynamic counters to use as episode number
+    for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
+        if not current_episode_num or data['value'] < current_episode_num:
+            current_episode_num = data['value']
+
+    # New regex to find [TEXT (XX)] format. 
+    # Group 1: TEXT (e.g., End, hi)
+    # Group 2: XX (e.g., 02, 05)
+    conditional_matches = re.findall(r"\[([a-zA-Z0-9\s]+)\s*\((.*?)\)\]", caption_template)
+
+    for match in conditional_matches:
+        text_to_add = match[0].strip() # e.g., "End", "hi"
+        target_num_str = re.sub(r'[^0-9]', '', match[1]).strip() # e.g., "02", "05"
+
+        placeholder = f"[{match[0].strip()} ({match[1].strip()})]"
+        
+        try:
+            target_num = int(target_num_str)
+        except ValueError:
+            # Invalid number, skip or replace with empty string
+            caption_template = caption_template.replace(placeholder, "")
+            continue
+        
+        # Apply the new logic: show TEXT if current_episode_num <= target_num
+        if current_episode_num <= target_num:
+            # Replace placeholder with the actual TEXT
+            caption_template = caption_template.replace(placeholder, text_to_add)
+        else:
+            # Replace placeholder with an empty string
+            caption_template = caption_template.replace(placeholder, "")
+
+    # --- 4. Old Episode Number Logic (Removed for simplicity and conflict avoidance) ---
+    # The old logic [01 (+01, 3u)] is highly complex and often conflicts with [re] and the new logic.
+    # Since the new [01]/[(01)] is now the primary episode counter, we can remove the old logic for a cleaner,
+    # less error-prone system.
+    
+    # Old logic for [01 (+01, 3u)] is commented out to prevent conflict.
+    # episode_matches_no_paren = re.findall(r"\[(\d+) \(\+(\d+), (\d+)u\)\]", caption_template)
+    # for match in episode_matches_no_paren:
+    #     original_placeholder = f"[{match[0]} (+{match[1]}, {match[2]}u)]"
+    #     caption_template = caption_template.replace(original_placeholder, "", 1) # Simply remove it
+
+    # Old logic for [End (XX, YY)] is removed as per user request to simplify.
+
+    # Final formatting
     return "**" + "\n".join(caption_template.splitlines()) + "**"
 
 
