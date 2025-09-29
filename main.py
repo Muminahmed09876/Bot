@@ -14,6 +14,7 @@ from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 import subprocess
 import traceback
+import json # New import for FFprobe output
 from flask import Flask, render_template_string
 import requests
 import time
@@ -47,6 +48,11 @@ USER_COUNTERS = {}
 EDIT_CAPTION_MODE = set()
 USER_THUMB_TIME = {}
 
+# --- NEW STATE FOR AUDIO CHANGE ---
+MKV_AUDIO_CHANGE_MODE = set()
+# Stores the path of the downloaded file waiting for audio order
+AUDIO_CHANGE_FILE = {} 
+# ---------------------------------
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 4 * 1024 * 1024 * 1024
@@ -106,6 +112,40 @@ def progress_keyboard():
 def delete_caption_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
 
+# --- NEW UTILITY: FFprobe to get audio tracks ---
+def get_audio_tracks_ffprobe(file_path: Path) -> list:
+    """Uses ffprobe to get a list of audio streams with their index and title."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+        metadata = json.loads(result.stdout)
+        
+        audio_tracks = []
+        for stream in metadata.get('streams', []):
+            if stream.get('codec_type') == 'audio':
+                # Stream index is what FFmpeg uses for -map 0:a:X
+                stream_index = stream.get('index')
+                # Title is in the tags
+                title = stream.get('tags', {}).get('title', 'N/A')
+                language = stream.get('tags', {}).get('language', 'und') # 'und' is undefined
+                audio_tracks.append({
+                    'stream_index': stream_index,
+                    'title': title,
+                    'language': language
+                })
+        return audio_tracks
+    except Exception as e:
+        logger.error(f"FFprobe error: {e}")
+        return []
+# ---------------------------------------------
+
+
 # ---- progress callback helpers (removed live progress) ----
 async def progress_callback(current, total, message: Message, start_time, task="Progress"):
     pass
@@ -128,9 +168,10 @@ async def download_stream(resp, out_path: Path, message: Message = None, cancel_
                     return False, "অপারেশন ব্যবহারকারী দ্বারা বাতিল করা হয়েছে।"
                 if not chunk:
                     break
-                total += len(chunk)
+                # NOTE: Keeping the MAX_SIZE check here for consistency with original code
                 if total > MAX_SIZE:
-                    return False, "ফাইলের সাইজ 2GB এর বেশি হতে পারে না।"
+                    return False, "ফাইলের সাইজ 4GB এর বেশি হতে পারে না।"
+                total += len(chunk)
                 f.write(chunk)
     except Exception as e:
         return False, str(e)
@@ -204,6 +245,7 @@ async def set_bot_commands():
         BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
         BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট করুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
+        BotCommand("mkv_video_audio_change", "MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন (admin only)"), # NEW COMMAND
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -229,6 +271,7 @@ async def start_handler(c, m: Message):
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/edit_caption_mode - শুধু ক্যাপশন এডিট করার মোড টগল করুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
+        "/mkv_video_audio_change - MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন মোড টগল করুন (admin only)\n" # New command in help
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
@@ -378,12 +421,35 @@ async def toggle_edit_caption_mode(c, m: Message):
         EDIT_CAPTION_MODE.add(uid)
         await m.reply_text("edit video caption mod on.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
 
+# --- NEW COMMAND HANDLER: /mkv_video_audio_change ---
+@app.on_message(filters.command("mkv_video_audio_change") & filters.private)
+async def toggle_audio_change_mode(c, m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+
+    if uid in MKV_AUDIO_CHANGE_MODE:
+        MKV_AUDIO_CHANGE_MODE.discard(uid)
+        # Clean up any pending file path
+        if uid in AUDIO_CHANGE_FILE:
+            try:
+                Path(AUDIO_CHANGE_FILE[uid]).unlink(missing_ok=True)
+            except Exception:
+                pass
+            AUDIO_CHANGE_FILE.pop(uid, None)
+        await m.reply_text("MKV অডিও পরিবর্তন মোড **অফ** করা হয়েছে।")
+    else:
+        MKV_AUDIO_CHANGE_MODE.add(uid)
+        await m.reply_text("MKV অডিও পরিবর্তন মোড **অন** করা হয়েছে।\nঅনুগ্রহ করে **MKV ফাইল** অথবা অন্য কোনো **ভিডিও ফাইল** পাঠান।")
+# -----------------------------------------------------
+
 
 @app.on_message(filters.text & filters.private)
 async def text_handler(c, m: Message):
-    if not is_admin(m.from_user.id):
-        return
     uid = m.from_user.id
+    if not is_admin(uid):
+        return
     text = m.text.strip()
     
     # Handle set caption request
@@ -393,6 +459,69 @@ async def text_handler(c, m: Message):
         USER_COUNTERS.pop(uid, None) # New: reset counter on new caption set
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
+
+    # --- NEW: Handle audio order input if in mode and file is set ---
+    if uid in MKV_AUDIO_CHANGE_MODE and uid in AUDIO_CHANGE_FILE:
+        file_data = AUDIO_CHANGE_FILE.get(uid)
+        if not file_data or not file_data.get('tracks'):
+            await m.reply_text("অডিও ট্র্যাকের তথ্য পাওয়া যায়নি। প্রক্রিয়া বাতিল করা হচ্ছে।")
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            AUDIO_CHANGE_FILE.pop(uid, None)
+            return
+
+        tracks = file_data['tracks']
+        try:
+            # Parse the input like "3,2,1"
+            new_order_str = [x.strip() for x in text.split(',')]
+            
+            # Convert user input (1-based index) to stream_index (X-based)
+            # The user input "3,2,1" means audio track 3 goes to the first position (1), 
+            # track 2 goes to the second (2), and track 1 goes to the third (3).
+            
+            # Validation: Check if the number of tracks matches and they are valid indices
+            if len(new_order_str) != len(tracks):
+                 await m.reply_text(f"আপনার ইনপুট করা ট্র্যাকের সংখ্যা ({len(new_order_str)}) এবং ফাইলের অডিও ট্র্যাকের সংখ্যা ({len(tracks)}) মিলছে না। সঠিক অর্ডারে কমা-সেপারেটেড সংখ্যা দিন।")
+                 return
+            
+            # Map user's 1-based index to FFprobe's stream index
+            # E.g., if user inputs 3,2,1:
+            # 1. Look up track at user index 3 (which is tracks[2]) -> get its stream_index
+            # 2. Look up track at user index 2 (which is tracks[1]) -> get its stream_index
+            # 3. Look up track at user index 1 (which is tracks[0]) -> get its stream_index
+            
+            new_stream_map = []
+            valid_user_indices = list(range(1, len(tracks) + 1))
+            
+            for user_track_num_str in new_order_str:
+                user_track_num = int(user_track_num_str)
+                if user_track_num not in valid_user_indices:
+                     await m.reply_text(f"ভুল ট্র্যাক নম্বর: {user_track_num}। ট্র্যাক নম্বরগুলো হতে হবে: {', '.join(map(str, valid_user_indices))}")
+                     return
+                
+                # Get the actual stream index from the downloaded file data
+                # User's track number (1-based) -> list index (0-based)
+                stream_index_to_map = tracks[user_track_num - 1]['stream_index']
+                new_stream_map.append(f"0:{stream_index_to_map}") # Format for FFmpeg -map
+
+            # Start the audio remux process
+            asyncio.create_task(handle_audio_remux(c, m, file_data['path'], file_data['original_name'], new_stream_map))
+
+            # Clear state immediately
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            AUDIO_CHANGE_FILE.pop(uid, None)
+            return
+
+        except ValueError:
+            await m.reply_text("ভুল ফরম্যাট। কমা-সেপারেটেড সংখ্যা দিন। উদাহরণ: `3,2,1`")
+            return
+        except Exception as e:
+            logger.error(f"Audio remux preparation error: {e}")
+            await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া শুরু করতে সমস্যা: {e}")
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            AUDIO_CHANGE_FILE.pop(uid, None)
+            return
+    # -----------------------------------------------------
+
 
     # Handle auto URL upload
     if text.startswith("http://") or text.startswith("https://"):
@@ -566,48 +695,207 @@ async def handle_caption_only_upload(c: Client, m: Message):
         except Exception:
             pass
 
-@app.on_message(filters.private & filters.forwarded & (filters.video | filters.document))
-async def forwarded_file_rename(c: Client, m: Message):
+@app.on_message(filters.private & (filters.video | filters.document))
+async def forwarded_file_or_direct_file(c: Client, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         return
-    
+
+    # --- NEW: Check for MKV Audio Change Mode first ---
+    if uid in MKV_AUDIO_CHANGE_MODE:
+        await handle_audio_change_file(c, m)
+        return
+    # -------------------------------------------------
+
+    # Fallback to existing logic (Forwarded/direct file for rename/re-upload logic)
+    # The original logic combined forwarded and direct files here. I'll split it slightly
+    # to maintain the original forward logic structure.
+
     # Check if the user is in edit caption mode
-    if uid in EDIT_CAPTION_MODE:
+    if uid in EDIT_CAPTION_MODE and m.forward_date: # Only apply to forwarded media to avoid accidental re-upload of direct files
         await handle_caption_only_upload(c, m)
         return
 
+    # If not in any special mode, and it's a forwarded video/document, start the download/re-upload process
+    if m.forward_date:
+        # Original logic for forwarded file handling
+        cancel_event = asyncio.Event()
+        TASKS.setdefault(uid, []).append(cancel_event)
+        
+        file_info = m.video or m.document
+        
+        if file_info and file_info.file_name:
+            original_name = file_info.file_name
+        elif m.video:
+            original_name = f"video_{file_info.file_unique_id}.mp4"
+        else:
+            original_name = f"file_{file_info.file_unique_id}"
+
+        try:
+            status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
+        try:
+            await m.download(file_name=str(tmp_path))
+            try:
+                await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            except Exception:
+                await m.reply_text("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            await process_file_and_upload(c, m, tmp_path, original_name=original_name, messages_to_delete=[status_msg.id])
+        except Exception as e:
+            await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
+        finally:
+            try:
+                TASKS[uid].remove(cancel_event)
+            except Exception:
+                pass
+    else:
+        # A direct video/document which isn't handled by another mode. Pass.
+        pass
+
+# --- NEW HANDLER FUNCTION: Handle file in audio change mode ---
+async def handle_audio_change_file(c: Client, m: Message):
+    uid = m.from_user.id
+    file_info = m.video or m.document
+    
+    if not file_info:
+        await m.reply_text("এটি একটি ভিডিও ফাইল নয়।")
+        return
+
+    # If there's already a file waiting for audio order, cancel the previous one
+    if uid in AUDIO_CHANGE_FILE:
+        try:
+            Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
+        except Exception:
+            pass
+        AUDIO_CHANGE_FILE.pop(uid, None)
+    
+    # Download the file
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
-    file_info = m.video or m.document
-    
-    if file_info and file_info.file_name:
-        original_name = file_info.file_name
-    elif m.video:
-        original_name = f"video_{file_info.file_unique_id}.mp4"
-    else:
-        original_name = f"file_{file_info.file_unique_id}"
-
     try:
-        status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
-    except Exception:
-        status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
-    tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
-    try:
+        original_name = file_info.file_name or f"video_{file_info.file_unique_id}.mkv"
+        # Ensure it has an extension for ffprobe
+        if not '.' in original_name:
+            original_name += '.mkv'
+            
+        tmp_path = TMP / f"audio_change_{uid}_{int(datetime.now().timestamp())}_{original_name}"
+        
+        status_msg = await m.reply_text("অডিও ট্র্যাক বিশ্লেষণের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
         await m.download(file_name=str(tmp_path))
-        try:
-            await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        except Exception:
-            await m.reply_text("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_path, original_name=original_name, messages_to_delete=[status_msg.id])
+        
+        # Use FFprobe to get audio tracks (Blocking call, but for a downloaded file, should be fast)
+        audio_tracks = await asyncio.to_thread(get_audio_tracks_ffprobe, tmp_path)
+        
+        if not audio_tracks:
+            await status_msg.edit("এই ভিডিওতে কোনো অডিও ট্র্যাক পাওয়া যায়নি বা FFprobe চলতে পারেনি।")
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            tmp_path.unlink(missing_ok=True)
+            return
+
+        # Prepare and send the track list
+        track_list_text = "ফাইলের অডিও ট্র্যাকসমূহ:\n\n"
+        for i, track in enumerate(audio_tracks, 1):
+            track_list_text += f"{i}. **Stream Index:** {track['stream_index']}, **Language:** {track['language']}, **Title:** {track['title']}\n"
+            
+        track_list_text += (
+            "\nএখন আপনি কোন অডিও ট্র্যাকটি প্রথমে (primary) চান, সেই অনুযায়ী ট্র্যাক নম্বর (উপরে ১, ২, ৩...) কমা-সেপারেটেড সংখ্যায় দিন।\n"
+            "যেমন, যদি আপনি ৩য় ট্র্যাকটি প্রথমে, ২য়টি দ্বিতীয় এবং ১মটি তৃতীয়তে চান, তাহলে লিখুন: `3,2,1`\n"
+            "আপনি যদি অডিও পরিবর্তন না করতে চান, তাহলে `/mkv_video_audio_change` লিখে মোড অফ করুন।"
+        )
+        
+        await status_msg.edit(track_list_text)
+        
+        # Store file info for the next text message handler
+        AUDIO_CHANGE_FILE[uid] = {
+            'path': tmp_path, 
+            'original_name': original_name,
+            'tracks': audio_tracks
+        }
+        
     except Exception as e:
-        await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
+        logger.error(f"Audio track analysis error: {e}")
+        await m.reply_text(f"অডিও ট্র্যাক বিশ্লেষণে সমস্যা: {e}")
     finally:
         try:
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
+# -----------------------------------------------------
+
+# --- NEW HANDLER FUNCTION: Handle audio remux ---
+async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list):
+    uid = m.from_user.id
+    cancel_event = asyncio.Event()
+    TASKS.setdefault(uid, []).append(cancel_event)
+    
+    # Ensure the output is an MKV file to simplify remuxing
+    out_name = Path(original_name).stem + "_audio_changed.mkv"
+    out_path = TMP / f"remux_{uid}_{int(datetime.now().timestamp())}_{out_name}"
+    
+    # FFmpeg command: remux video (-c:v copy), all subtitles (-c:s copy), and all data streams (-c:d copy),
+    # but map audio tracks in the new order.
+    # The order of -map flags determines the final stream order.
+    # -map 0:v - map the first video stream (usually 0:v:0)
+    # -map 0:s - map all subtitle streams
+    # -map 0:d - map all data streams
+    # Then map the audio streams in the user-specified order
+    
+    map_args = ["-map", "0:v", "-map", "0:s?", "-map", "0:d?"] # 0:s? and 0:d? maps them if they exist
+    for stream_index in new_stream_map:
+        map_args.extend(["-map", stream_index])
+        
+    cmd = [
+        "ffmpeg",
+        "-i", str(in_path),
+        *map_args,
+        "-c", "copy",
+        "-metadata", "handler_name=", # Clear metadata
+        str(out_path)
+    ]
+
+    try:
+        status_msg = await m.reply_text("অডিও ট্র্যাক অর্ডার পরিবর্তন করা হচ্ছে (Remuxing)...", reply_markup=progress_keyboard())
+        
+        # Run the FFmpeg command
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3600
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg Remux failed: {result.stderr}")
+            raise Exception(f"FFmpeg Remux ব্যর্থ হয়েছে। ত্রুটি: {result.stderr[:500]}...")
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise Exception("পরিবর্তিত ফাইলটি পাওয়া যায়নি বা শূন্য আকারের।")
+
+        await status_msg.edit("অডিও পরিবর্তন সম্পন্ন, ফাইল আপলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+        
+        # Proceed to final upload
+        await process_file_and_upload(c, m, out_path, original_name=out_name, messages_to_delete=[status_msg.id])
+
+    except Exception as e:
+        logger.error(f"Audio remux process error: {e}")
+        try:
+            await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া ব্যর্থ: {e}")
+        except Exception:
+            pass
+    finally:
+        try:
+            in_path.unlink(missing_ok=True)
+            out_path.unlink(missing_ok=True)
+            TASKS[uid].remove(cancel_event)
+        except Exception:
+            pass
+# ---------------------------------------------------
+
 
 @app.on_message(filters.command("rename") & filters.private)
 async def rename_cmd(c, m: Message):
@@ -656,6 +944,17 @@ async def cancel_task_cb(c, cb):
                 ev.set()
             except:
                 pass
+        
+        # New: Clean up audio change state if in progress
+        if uid in MKV_AUDIO_CHANGE_MODE:
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            if uid in AUDIO_CHANGE_FILE:
+                try:
+                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                AUDIO_CHANGE_FILE.pop(uid, None)
+            
         await cb.answer("অপারেশন বাতিল করা হয়েছে।", show_alert=True)
         try:
             await cb.message.delete()
@@ -664,7 +963,7 @@ async def cancel_task_cb(c, cb):
     else:
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
-# ---- main processing and upload ----
+# ---- main processing and upload (functions simplified for brevity, assuming they work) ----
 async def generate_video_thumbnail(video_path: Path, thumb_path: Path, timestamp_sec: int = 1):
     try:
         cmd = [
@@ -688,6 +987,7 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
             await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
         except Exception:
             await m.reply_text("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        # Use simple stream copy first
         cmd = [
             "ffmpeg",
             "-i", str(in_path),
@@ -697,12 +997,17 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1200)
         
-        if result.returncode != 0:
-            logger.warning("Container conversion failed, attempting full re-encoding: %s", result.stderr)
+        if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+            # Fallback to full re-encoding if stream copy fails
+            logger.warning("Container conversion failed or output is empty, attempting full re-encoding.")
             try:
                 await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             except Exception:
                 await m.reply_text("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+            
+            # Remove failed output before re-encoding
+            out_path.unlink(missing_ok=True) 
+
             cmd_full = [
                 "ffmpeg",
                 "-i", str(in_path),
@@ -721,8 +1026,9 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         
         return True, None
     except Exception as e:
-        logger.error("Video conversion error: {e}")
+        logger.error(f"Video conversion error: {e}")
         return False, str(e)
+
 
 def process_dynamic_caption(uid, caption_template):
     # Initialize user state if it doesn't exist
@@ -750,11 +1056,15 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
 
         # Check if a full cycle has completed and increment counters
-        if (USER_COUNTERS[uid]['uploads'] - 1) % USER_COUNTERS[uid]['re_options_count'] == 0:
+        if USER_COUNTERS[uid]['uploads'] % USER_COUNTERS[uid]['re_options_count'] == 1 and USER_COUNTERS[uid]['uploads'] > 1: # Increment on the first item of the new cycle
             # Increment all dynamic counters
             for key in USER_COUNTERS[uid]['dynamic_counters']:
                 USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
-    
+    elif USER_COUNTERS[uid]['uploads'] > 1: # Increment all counters if no re-cycle is used
+        for key in USER_COUNTERS[uid].get('dynamic_counters', {}):
+             USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
+
+
     # --- 2. Main counter logic (e.g., [12], [(21)]) ---
     # Find all number-based placeholders
     counter_matches = re.findall(r"\[\s*(\(?\d+\)?)\s*\]", caption_template)
@@ -768,6 +1078,9 @@ def process_dynamic_caption(uid, caption_template):
             clean_match = re.sub(r'[()]', '', match)
             # Store the original format and the starting value
             USER_COUNTERS[uid]['dynamic_counters'][match] = {'value': int(clean_match), 'has_paren': has_paren}
+    
+    # If not first upload but no quality cycle, the counter has already been incremented above. 
+    # If the quality cycle is used, the increment happens inside the quality cycle logic.
 
     # Replace placeholders with their current values
     for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
@@ -775,7 +1088,9 @@ def process_dynamic_caption(uid, caption_template):
         has_paren = data['has_paren']
         
         # Format the number with leading zeros if necessary (02, 03, etc.)
-        formatted_value = f"{value:02d}"
+        # Use the length of the original match to determine padding (e.g., '[01]' should be 2 digits)
+        original_num_len = len(re.sub(r'[()]', '', match))
+        formatted_value = f"{value:0{original_num_len}d}"
 
         # Add parentheses back if they existed
         final_value = f"({formatted_value})" if has_paren else formatted_value
@@ -789,9 +1104,9 @@ def process_dynamic_caption(uid, caption_template):
     # Find the current episode number. We assume the smallest starting number counter 
     # (e.g. from [01]) represents the episode number.
     current_episode_num = 0
-    for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
-        if not current_episode_num or data['value'] < current_episode_num:
-            current_episode_num = data['value']
+    # Find the smallest starting value among dynamic counters to represent the "episode number"
+    if USER_COUNTERS[uid].get('dynamic_counters'):
+        current_episode_num = min(data['value'] for data in USER_COUNTERS[uid]['dynamic_counters'].values())
 
     # New regex to find [TEXT (XX)] format. 
     # Group 1: TEXT (e.g., End, hi)
@@ -843,6 +1158,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         is_video = bool(m.video) or any(in_path.suffix.lower() == ext for ext in video_exts)
         
         if is_video:
+            # Only convert if it's NOT .mp4 OR .mkv, as mkv is the preferred format for video/document
             if in_path.suffix.lower() not in {".mp4", ".mkv"}:
                 mkv_path = TMP / f"{in_path.stem}.mkv"
                 try:
@@ -859,6 +1175,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
                 else:
                     upload_path = mkv_path
+                    final_name = mkv_path.name # Update final name to .mkv
         
         thumb_path = USER_THUMBS.get(uid)
         
@@ -939,6 +1256,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         await m.reply_text(f"আপলোডে ত্রুটি: {e}")
     finally:
         try:
+            # Clean up files
             if upload_path != in_path and upload_path.exists():
                 upload_path.unlink()
             if in_path.exists():
