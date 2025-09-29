@@ -14,7 +14,7 @@ from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 import subprocess
 import traceback
-import json # New import for FFprobe output
+import json 
 from flask import Flask, render_template_string
 import requests
 import time
@@ -435,6 +435,10 @@ async def toggle_audio_change_mode(c, m: Message):
         if uid in AUDIO_CHANGE_FILE:
             try:
                 Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
+                # <--- AUTO-DELETE FIX: Delete the prompt message on mode off
+                if 'message_id' in AUDIO_CHANGE_FILE[uid]:
+                    await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+                # -----------------------------------------------------------------
             except Exception:
                 pass
             AUDIO_CHANGE_FILE.pop(uid, None)
@@ -495,8 +499,19 @@ async def text_handler(c, m: Message):
                 # FFmpeg uses "input_index:stream_index", e.g., "0:1", "0:2" etc.
                 new_stream_map.append(f"0:{stream_index_to_map}") 
 
+            # <--- AUTO-DELETE FIX: Get the message ID to delete
+            track_list_message_id = file_data.get('message_id')
+            # ---------------------------------------------------
+
             # Start the audio remux process
-            asyncio.create_task(handle_audio_remux(c, m, file_data['path'], file_data['original_name'], new_stream_map))
+            asyncio.create_task(
+                handle_audio_remux(
+                    c, m, file_data['path'], 
+                    file_data['original_name'], 
+                    new_stream_map, 
+                    messages_to_delete=[track_list_message_id, m.id] # <--- AUTO-DELETE FIX: Pass both the track list ID and the current message ID
+                )
+            )
 
             # Clear state immediately
             # NOTE: Cleanup of files is done in handle_audio_remux's finally block
@@ -760,6 +775,10 @@ async def handle_audio_change_file(c: Client, m: Message):
     if uid in AUDIO_CHANGE_FILE:
         try:
             Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
+            # <--- AUTO-DELETE FIX: Clean up previous prompt message
+            if 'message_id' in AUDIO_CHANGE_FILE[uid]:
+                await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+            # -----------------------------------------------------------------
         except Exception:
             pass
         AUDIO_CHANGE_FILE.pop(uid, None)
@@ -799,13 +818,15 @@ async def handle_audio_change_file(c: Client, m: Message):
             "আপনি যদি অডিও পরিবর্তন না করতে চান, তাহলে `/mkv_video_audio_change` লিখে মোড অফ করুন।"
         )
         
-        await status_msg.edit(track_list_text)
+        # This message now holds the track list/prompt
+        await status_msg.edit(track_list_text) 
         
         # Store file info for the next text message handler
         AUDIO_CHANGE_FILE[uid] = {
             'path': tmp_path, 
             'original_name': original_name,
-            'tracks': audio_tracks
+            'tracks': audio_tracks,
+            'message_id': status_msg.id # <--- AUTO-DELETE FIX: Store the message ID
         }
         
     except Exception as e:
@@ -819,7 +840,8 @@ async def handle_audio_change_file(c: Client, m: Message):
 # -----------------------------------------------------
 
 # --- NEW HANDLER FUNCTION: Handle audio remux (FIXED with disposition flags) ---
-async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list):
+# <--- AUTO-DELETE FIX: Added messages_to_delete to the signature
+async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list, messages_to_delete: list = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
@@ -871,8 +893,14 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
 
         await status_msg.edit("অডিও পরিবর্তন সম্পন্ন, ফাইল আপলোড করা হচ্ছে...", reply_markup=progress_keyboard())
         
+        # <--- AUTO-DELETE FIX: Combine all messages to delete
+        all_messages_to_delete = messages_to_delete if messages_to_delete else []
+        all_messages_to_delete.append(status_msg.id) # Add the current progress message ID
+        # ---------------------------------------------------
+
         # Proceed to final upload
-        await process_file_and_upload(c, m, out_path, original_name=out_name, messages_to_delete=[status_msg.id])
+        # <--- AUTO-DELETE FIX: Pass the combined list to the final upload step
+        await process_file_and_upload(c, m, out_path, original_name=out_name, messages_to_delete=all_messages_to_delete) 
 
     except Exception as e:
         logger.error(f"Audio remux process error: {e}")
@@ -942,6 +970,13 @@ async def cancel_task_cb(c, cb):
         if uid in MKV_AUDIO_CHANGE_MODE:
             MKV_AUDIO_CHANGE_MODE.discard(uid)
             if uid in AUDIO_CHANGE_FILE:
+                # <--- AUTO-DELETE FIX: Delete the prompt message on cancel
+                if 'message_id' in AUDIO_CHANGE_FILE[uid]:
+                    try:
+                        await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+                    except Exception:
+                        pass
+                # -----------------------------------------------------------------
                 try:
                     Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
                 except Exception:
@@ -1185,6 +1220,11 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             messages_to_delete.append(status_msg.id)
 
         if cancel_event.is_set():
+            if messages_to_delete:
+                try:
+                    await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
+                except Exception:
+                    pass
             try:
                 await status_msg.edit("অপারেশন বাতিল করা হয়েছে, আপলোড শুরু করা হয়নি।", reply_markup=None)
             except Exception:
@@ -1223,6 +1263,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 
                 if messages_to_delete:
                     try:
+                        # <--- AUTO-DELETE FIX: Delete all tracked messages on SUCCESS
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
                     except Exception:
                         pass
