@@ -129,8 +129,8 @@ def get_audio_tracks_ffprobe(file_path: Path) -> list:
         audio_tracks = []
         for stream in metadata.get('streams', []):
             if stream.get('codec_type') == 'audio':
-                # Stream index is what FFmpeg uses for -map 0:a:X
-                stream_index = stream.get('index')
+                # Stream index is what FFmpeg uses for -map 0:a:X (e.g., 1, 2, 3...)
+                stream_index = stream.get('index') 
                 # Title is in the tags
                 title = stream.get('tags', {}).get('title', 'N/A')
                 language = stream.get('tags', {}).get('language', 'und') # 'und' is undefined
@@ -434,7 +434,7 @@ async def toggle_audio_change_mode(c, m: Message):
         # Clean up any pending file path
         if uid in AUDIO_CHANGE_FILE:
             try:
-                Path(AUDIO_CHANGE_FILE[uid]).unlink(missing_ok=True)
+                Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
             except Exception:
                 pass
             AUDIO_CHANGE_FILE.pop(uid, None)
@@ -474,20 +474,10 @@ async def text_handler(c, m: Message):
             # Parse the input like "3,2,1"
             new_order_str = [x.strip() for x in text.split(',')]
             
-            # Convert user input (1-based index) to stream_index (X-based)
-            # The user input "3,2,1" means audio track 3 goes to the first position (1), 
-            # track 2 goes to the second (2), and track 1 goes to the third (3).
-            
             # Validation: Check if the number of tracks matches and they are valid indices
             if len(new_order_str) != len(tracks):
                  await m.reply_text(f"আপনার ইনপুট করা ট্র্যাকের সংখ্যা ({len(new_order_str)}) এবং ফাইলের অডিও ট্র্যাকের সংখ্যা ({len(tracks)}) মিলছে না। সঠিক অর্ডারে কমা-সেপারেটেড সংখ্যা দিন।")
                  return
-            
-            # Map user's 1-based index to FFprobe's stream index
-            # E.g., if user inputs 3,2,1:
-            # 1. Look up track at user index 3 (which is tracks[2]) -> get its stream_index
-            # 2. Look up track at user index 2 (which is tracks[1]) -> get its stream_index
-            # 3. Look up track at user index 1 (which is tracks[0]) -> get its stream_index
             
             new_stream_map = []
             valid_user_indices = list(range(1, len(tracks) + 1))
@@ -501,12 +491,15 @@ async def text_handler(c, m: Message):
                 # Get the actual stream index from the downloaded file data
                 # User's track number (1-based) -> list index (0-based)
                 stream_index_to_map = tracks[user_track_num - 1]['stream_index']
-                new_stream_map.append(f"0:{stream_index_to_map}") # Format for FFmpeg -map
+                
+                # FFmpeg uses "input_index:stream_index", e.g., "0:1", "0:2" etc.
+                new_stream_map.append(f"0:{stream_index_to_map}") 
 
             # Start the audio remux process
             asyncio.create_task(handle_audio_remux(c, m, file_data['path'], file_data['original_name'], new_stream_map))
 
             # Clear state immediately
+            # NOTE: Cleanup of files is done in handle_audio_remux's finally block
             MKV_AUDIO_CHANGE_MODE.discard(uid)
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
@@ -825,7 +818,7 @@ async def handle_audio_change_file(c: Client, m: Message):
             pass
 # -----------------------------------------------------
 
-# --- NEW HANDLER FUNCTION: Handle audio remux ---
+# --- NEW HANDLER FUNCTION: Handle audio remux (FIXED with disposition flags) ---
 async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
@@ -837,20 +830,18 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
     
     # FFmpeg command: remux video (-c:v copy), all subtitles (-c:s copy), and all data streams (-c:d copy),
     # but map audio tracks in the new order.
-    # The order of -map flags determines the final stream order.
-    # -map 0:v - map the first video stream (usually 0:v:0)
-    # -map 0:s - map all subtitle streams
-    # -map 0:d - map all data streams
-    # Then map the audio streams in the user-specified order
     
     map_args = ["-map", "0:v", "-map", "0:s?", "-map", "0:d?"] # 0:s? and 0:d? maps them if they exist
+    # Add the user-specified audio maps
     for stream_index in new_stream_map:
         map_args.extend(["-map", stream_index])
         
     cmd = [
         "ffmpeg",
         "-i", str(in_path),
+        "-disposition:a", "0",            # <-- FIX: সমস্ত অডিও ট্র্যাকের 'Default' ফ্ল্যাগ রিসেট
         *map_args,
+        "-disposition:a:0", "default",    # <-- FIX: নতুন অর্ডারের প্রথম ট্র্যাককে (a:0) ডিফল্ট হিসেবে সেট
         "-c", "copy",
         "-metadata", "handler_name=", # Clear metadata
         str(out_path)
@@ -871,6 +862,8 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
         
         if result.returncode != 0:
             logger.error(f"FFmpeg Remux failed: {result.stderr}")
+            # Ensure the output file is not present after failure
+            out_path.unlink(missing_ok=True)
             raise Exception(f"FFmpeg Remux ব্যর্থ হয়েছে। ত্রুটি: {result.stderr[:500]}...")
 
         if not out_path.exists() or out_path.stat().st_size == 0:
@@ -1056,11 +1049,12 @@ def process_dynamic_caption(uid, caption_template):
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
 
         # Check if a full cycle has completed and increment counters
-        if USER_COUNTERS[uid]['uploads'] % USER_COUNTERS[uid]['re_options_count'] == 1 and USER_COUNTERS[uid]['uploads'] > 1: # Increment on the first item of the new cycle
+        # Increment happens when we are about to start a new cycle (i.e., when (uploads - 1) % len == 0, but for uploads > 1)
+        if (USER_COUNTERS[uid]['uploads'] - 1) % USER_COUNTERS[uid]['re_options_count'] == 0 and USER_COUNTERS[uid]['uploads'] > 1:
             # Increment all dynamic counters
             for key in USER_COUNTERS[uid]['dynamic_counters']:
                 USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
-    elif USER_COUNTERS[uid]['uploads'] > 1: # Increment all counters if no re-cycle is used
+    elif USER_COUNTERS[uid]['uploads'] > 1: # Increment all counters if no quality cycle is used
         for key in USER_COUNTERS[uid].get('dynamic_counters', {}):
              USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
 
@@ -1117,26 +1111,23 @@ def process_dynamic_caption(uid, caption_template):
         text_to_add = match[0].strip() # e.g., "End", "hi"
         target_num_str = re.sub(r'[^0-9]', '', match[1]).strip() # e.g., "02", "05"
 
-        placeholder = f"[{match[0].strip()} ({match[1].strip()})]"
+        placeholder = re.escape(f"[{match[0].strip()} ({match[1].strip()})]")
         
         try:
             target_num = int(target_num_str)
         except ValueError:
             # Invalid number, skip or replace with empty string
-            caption_template = caption_template.replace(placeholder, "")
+            caption_template = re.sub(placeholder, "", caption_template)
             continue
         
-        # *** FIX: New logic - show TEXT only if current_episode_num IS EQUAL TO target_num ***
+        # FIX: New logic - show TEXT only if current_episode_num IS EQUAL TO target_num
         if current_episode_num == target_num:
             # Replace placeholder with the actual TEXT
-            caption_template = caption_template.replace(placeholder, text_to_add)
+            caption_template = re.sub(placeholder, text_to_add, caption_template)
         else:
             # Replace placeholder with an empty string
-            caption_template = caption_template.replace(placeholder, "")
+            caption_template = re.sub(placeholder, "", caption_template)
 
-
-    # --- 4. Old Episode Number Logic (Removed for simplicity and conflict avoidance) ---
-    
     # Final formatting
     return "**" + "\n".join(caption_template.splitlines()) + "**"
 
