@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
-from pyrogram.types import Message, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 from PIL import Image
 from hachoir.parser import createParser
@@ -48,11 +48,11 @@ USER_COUNTERS = {}
 EDIT_CAPTION_MODE = set()
 USER_THUMB_TIME = {}
 
-# --- NEW STATE FOR AUDIO CHANGE ---
+# --- STATE FOR AUDIO CHANGE ---
 MKV_AUDIO_CHANGE_MODE = set()
 # Stores the path of the downloaded file waiting for audio order
 AUDIO_CHANGE_FILE = {} 
-# ---------------------------------
+# ------------------------------
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 MAX_SIZE = 4 * 1024 * 1024 * 1024
@@ -79,6 +79,22 @@ def extract_drive_id(url: str) -> str:
         if m:
             return m.group(1)
     return None
+
+# Helper function for consistent renaming
+def generate_new_filename(original_name: str) -> str:
+    """Generates the new standardized filename while preserving the original extension."""
+    BASE_NEW_NAME = "[@TA_HD_Anime] Telegram Channel"
+    file_path = Path(original_name)
+    file_ext = file_path.suffix.lower()
+    
+    # Clean up the extension and ensure it starts with a dot
+    file_ext = "." + file_ext.lstrip('.')
+    
+    # If a file like 'video_id' or 'file_id' comes without a proper extension, default to .mp4
+    if not file_ext or file_ext == '.':
+        return BASE_NEW_NAME + ".mp4"
+        
+    return BASE_NEW_NAME + file_ext
 
 def get_video_duration(file_path: Path) -> int:
     try:
@@ -112,6 +128,22 @@ def progress_keyboard():
 def delete_caption_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
 
+# --- NEW UTILITY: Keyboard for Mode Check ---
+def mode_check_keyboard(uid: int) -> InlineKeyboardMarkup:
+    audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+    caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
+    
+    # Check if a file is waiting for track order input
+    waiting_status = " (অর্ডার বাকি)" if uid in AUDIO_CHANGE_FILE else ""
+    
+    keyboard = [
+        [InlineKeyboardButton(f"MKV Audio Change Mode {audio_status}{waiting_status}", callback_data="toggle_audio_mode")],
+        [InlineKeyboardButton(f"Edit Caption Mode {caption_status}", callback_data="toggle_caption_mode")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+# ---------------------------------------------
+
+
 # --- NEW UTILITY: FFprobe to get audio tracks ---
 def get_audio_tracks_ffprobe(file_path: Path) -> list:
     """Uses ffprobe to get a list of audio streams with their index and title."""
@@ -129,9 +161,7 @@ def get_audio_tracks_ffprobe(file_path: Path) -> list:
         audio_tracks = []
         for stream in metadata.get('streams', []):
             if stream.get('codec_type') == 'audio':
-                # Stream index is what FFmpeg uses for -map 0:a:X (e.g., 1, 2, 3...)
                 stream_index = stream.get('index') 
-                # Title is in the tags
                 title = stream.get('tags', {}).get('title', 'N/A')
                 language = stream.get('tags', {}).get('language', 'und') # 'und' is undefined
                 audio_tracks.append({
@@ -168,7 +198,6 @@ async def download_stream(resp, out_path: Path, message: Message = None, cancel_
                     return False, "অপারেশন ব্যবহারকারী দ্বারা বাতিল করা হয়েছে।"
                 if not chunk:
                     break
-                # NOTE: Keeping the MAX_SIZE check here for consistency with original code
                 if total > MAX_SIZE:
                     return False, "ফাইলের সাইজ 4GB এর বেশি হতে পারে না।"
                 total += len(chunk)
@@ -245,7 +274,8 @@ async def set_bot_commands():
         BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
         BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট করুন (admin only)"),
         BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
-        BotCommand("mkv_video_audio_change", "MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন (admin only)"), # NEW COMMAND
+        BotCommand("mkv_video_audio_change", "MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন (admin only)"),
+        BotCommand("mode_check", "বর্তমান মোড স্ট্যাটাস চেক করুন (admin only)"), # NEW COMMAND
         BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
         BotCommand("help", "সহায়িকা")
     ]
@@ -271,7 +301,8 @@ async def start_handler(c, m: Message):
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/edit_caption_mode - শুধু ক্যাপশন এডিট করার মোড টগল করুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
-        "/mkv_video_audio_change - MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন মোড টগল করুন (admin only)\n" # New command in help
+        "/mkv_video_audio_change - MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন মোড টগল করুন (admin only)\n"
+        "/mode_check - বর্তমান মোড স্ট্যাটাস চেক করুন এবং পরিবর্তন করুন (admin only)\n" # NEW COMMAND in help
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
@@ -363,7 +394,7 @@ async def photo_handler(c, m: Message):
     else:
         pass
 
-# New handlers for caption
+# Handlers for caption
 @app.on_message(filters.command("set_caption") & filters.private)
 async def set_caption_prompt(c, m: Message):
     if not is_admin(m.from_user.id):
@@ -373,7 +404,6 @@ async def set_caption_prompt(c, m: Message):
     # Reset counter data when a new caption is about to be set
     USER_COUNTERS.pop(m.from_user.id, None)
     
-    # *** Updated Caption Message as requested ***
     await m.reply_text(
         "ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন:\n"
         "1. **নম্বর বৃদ্ধি:** `[01]`, `[(01)]` (নম্বর স্বয়ংক্রিয়ভাবে বাড়বে)\n"
@@ -406,7 +436,7 @@ async def delete_caption_cb(c, cb):
     else:
         await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
 
-# New handler to toggle edit caption mode
+# Handler to toggle edit caption mode
 @app.on_message(filters.command("edit_caption_mode") & filters.private)
 async def toggle_edit_caption_mode(c, m: Message):
     uid = m.from_user.id
@@ -416,12 +446,12 @@ async def toggle_edit_caption_mode(c, m: Message):
 
     if uid in EDIT_CAPTION_MODE:
         EDIT_CAPTION_MODE.discard(uid)
-        await m.reply_text("edit video caption mod off.\nএখন থেকে আপলোড করা ভিডিওর রিনেম ও থাম্বনেইল পরিবর্তন হবে, এবং সেভ করা ক্যাপশন যুক্ত হবে।")
+        await m.reply_text("edit video caption mod **OFF**.\nএখন থেকে আপলোড করা ভিডিওর রিনেম ও থাম্বনেইল পরিবর্তন হবে, এবং সেভ করা ক্যাপশন যুক্ত হবে।")
     else:
         EDIT_CAPTION_MODE.add(uid)
-        await m.reply_text("edit video caption mod on.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
+        await m.reply_text("edit video caption mod **ON**.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
 
-# --- NEW COMMAND HANDLER: /mkv_video_audio_change ---
+# --- HANDLER: /mkv_video_audio_change ---
 @app.on_message(filters.command("mkv_video_audio_change") & filters.private)
 async def toggle_audio_change_mode(c, m: Message):
     uid = m.from_user.id
@@ -435,18 +465,99 @@ async def toggle_audio_change_mode(c, m: Message):
         if uid in AUDIO_CHANGE_FILE:
             try:
                 Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-                # <--- AUTO-DELETE FIX: Delete the prompt message on mode off
                 if 'message_id' in AUDIO_CHANGE_FILE[uid]:
                     await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-                # -----------------------------------------------------------------
             except Exception:
                 pass
             AUDIO_CHANGE_FILE.pop(uid, None)
         await m.reply_text("MKV অডিও পরিবর্তন মোড **অফ** করা হয়েছে।")
     else:
         MKV_AUDIO_CHANGE_MODE.add(uid)
-        await m.reply_text("MKV অডিও পরিবর্তন মোড **অন** করা হয়েছে।\nঅনুগ্রহ করে **MKV ফাইল** অথবা অন্য কোনো **ভিডিও ফাইল** পাঠান।")
-# -----------------------------------------------------
+        await m.reply_text("MKV অডিও পরিবর্তন মোড **অন** করা হয়েছে।\nঅনুগ্রহ করে **MKV ফাইল** অথবা অন্য কোনো **ভিডিও ফাইল** পাঠান।\n(এই মোড ম্যানুয়ালি অফ না করা পর্যন্ত চালু থাকবে।)")
+
+# --- NEW HANDLER: /mode_check ---
+@app.on_message(filters.command("mode_check") & filters.private)
+async def mode_check_cmd(c, m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
+        return
+    
+    audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+    caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
+    
+    waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
+    
+    status_text = (
+        "🤖 **বর্তমান মোড স্ট্যাটাস:**\n\n"
+        f"1. **MKV Audio Change Mode:** `{audio_status}`\n"
+        f"   - *কাজ:* ফরওয়ার্ড/ডাউনলোড করা MKV/ভিডিও ফাইলের অডিও ট্র্যাক অর্ডার পরিবর্তন করে। (ম্যানুয়ালি অফ না করা পর্যন্ত ON থাকবে)\n"
+        f"   - *স্ট্যাটাস:* {waiting_status_text}\n\n"
+        f"2. **Edit Caption Mode:** `{caption_status}`\n"
+        f"   - *কাজ:* ফরওয়ার্ড করা ভিডিওর রিনেম বা থাম্বনেইল পরিবর্তন না করে শুধু সেভ করা ক্যাপশন যুক্ত করে।\n\n"
+        "নিচের বাটনগুলিতে ক্লিক করে মোড পরিবর্তন করুন।"
+    )
+    
+    await m.reply_text(status_text, reply_markup=mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
+
+# --- NEW CALLBACK: Mode Toggle Buttons ---
+@app.on_callback_query(filters.regex("toggle_(audio|caption)_mode"))
+async def mode_toggle_callback(c: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_admin(uid):
+        await cb.answer("আপনার অনুমতি নেই।", show_alert=True)
+        return
+
+    action = cb.data
+    
+    if action == "toggle_audio_mode":
+        if uid in MKV_AUDIO_CHANGE_MODE:
+            # Turning OFF: Clear mode and cleanup pending file
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            if uid in AUDIO_CHANGE_FILE:
+                try:
+                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
+                    if 'message_id' in AUDIO_CHANGE_FILE[uid]:
+                        await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+                except Exception:
+                    pass
+                AUDIO_CHANGE_FILE.pop(uid, None)
+            message = "MKV Audio Change Mode OFF."
+        else:
+            # Turning ON
+            MKV_AUDIO_CHANGE_MODE.add(uid)
+            message = "MKV Audio Change Mode ON."
+            
+    elif action == "toggle_caption_mode":
+        if uid in EDIT_CAPTION_MODE:
+            EDIT_CAPTION_MODE.discard(uid)
+            message = "Edit Caption Mode OFF."
+        else:
+            EDIT_CAPTION_MODE.add(uid)
+            message = "Edit Caption Mode ON."
+            
+    # Refresh the keyboard and edit the original message (similar to mode_check_cmd)
+    try:
+        audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+        caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
+        
+        waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
+
+        status_text = (
+            "🤖 **বর্তমান মোড স্ট্যাটাস:**\n\n"
+            f"1. **MKV Audio Change Mode:** `{audio_status}`\n"
+            f"   - *কাজ:* ফরওয়ার্ড/ডাউনলোড করা MKV/ভিডিও ফাইলের অডিও ট্র্যাক অর্ডার পরিবর্তন করে। (ম্যানুয়ালি অফ না করা পর্যন্ত ON থাকবে)\n"
+            f"   - *স্ট্যাটাস:* {waiting_status_text}\n\n"
+            f"2. **Edit Caption Mode:** `{caption_status}`\n"
+            f"   - *কাজ:* ফরওয়ার্ড করা ভিডিওর রিনেম বা থাম্বনেইল পরিবর্তন না করে শুধু সেভ করা ক্যাপশন যুক্ত করে।\n\n"
+            "নিচের বাটনগুলিতে ক্লিক করে মোড পরিবর্তন করুন।"
+        )
+        
+        await cb.message.edit_text(status_text, reply_markup=mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
+        await cb.answer(message, show_alert=True)
+    except Exception as e:
+        logger.error(f"Callback edit error: {e}")
+        await cb.answer(message, show_alert=True)
 
 
 @app.on_message(filters.text & filters.private)
@@ -464,12 +575,12 @@ async def text_handler(c, m: Message):
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
 
-    # --- NEW: Handle audio order input if in mode and file is set ---
+    # --- Handle audio order input if in mode and file is set ---
     if uid in MKV_AUDIO_CHANGE_MODE and uid in AUDIO_CHANGE_FILE:
         file_data = AUDIO_CHANGE_FILE.get(uid)
         if not file_data or not file_data.get('tracks'):
             await m.reply_text("অডিও ট্র্যাকের তথ্য পাওয়া যায়নি। প্রক্রিয়া বাতিল করা হচ্ছে।")
-            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
 
@@ -492,16 +603,10 @@ async def text_handler(c, m: Message):
                      await m.reply_text(f"ভুল ট্র্যাক নম্বর: {user_track_num}। ট্র্যাক নম্বরগুলো হতে হবে: {', '.join(map(str, valid_user_indices))}")
                      return
                 
-                # Get the actual stream index from the downloaded file data
-                # User's track number (1-based) -> list index (0-based)
                 stream_index_to_map = tracks[user_track_num - 1]['stream_index']
-                
-                # FFmpeg uses "input_index:stream_index", e.g., "0:1", "0:2" etc.
                 new_stream_map.append(f"0:{stream_index_to_map}") 
 
-            # <--- AUTO-DELETE FIX: Get the message ID to delete
             track_list_message_id = file_data.get('message_id')
-            # ---------------------------------------------------
 
             # Start the audio remux process
             asyncio.create_task(
@@ -509,14 +614,13 @@ async def text_handler(c, m: Message):
                     c, m, file_data['path'], 
                     file_data['original_name'], 
                     new_stream_map, 
-                    messages_to_delete=[track_list_message_id, m.id] # <--- AUTO-DELETE FIX: Pass both the track list ID and the current message ID
+                    messages_to_delete=[track_list_message_id, m.id]
                 )
             )
 
             # Clear state immediately
-            # NOTE: Cleanup of files is done in handle_audio_remux's finally block
-            MKV_AUDIO_CHANGE_MODE.discard(uid)
-            AUDIO_CHANGE_FILE.pop(uid, None)
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
+            AUDIO_CHANGE_FILE.pop(uid, None) # Clear only the waiting file state
             return
 
         except ValueError:
@@ -525,7 +629,7 @@ async def text_handler(c, m: Message):
         except Exception as e:
             logger.error(f"Audio remux preparation error: {e}")
             await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া শুরু করতে সমস্যা: {e}")
-            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
     # -----------------------------------------------------
@@ -601,7 +705,12 @@ async def handle_url_download_and_upload(c: Client, m: Message, url: str):
             await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
         except Exception:
             await m.reply_text("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-        await process_file_and_upload(c, m, tmp_in, original_name=safe_name, messages_to_delete=[status_msg.id])
+            
+        # NEW RENAME FEATURE: URL আপলোডের জন্য নাম পরিবর্তন
+        renamed_file = generate_new_filename(safe_name)
+        # -------------------------------------------------------
+
+        await process_file_and_upload(c, m, tmp_in, original_name=renamed_file, messages_to_delete=[status_msg.id])
     except Exception as e:
         traceback.print_exc()
         try:
@@ -709,15 +818,13 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
     if not is_admin(uid):
         return
 
-    # --- NEW: Check for MKV Audio Change Mode first ---
+    # --- Check for MKV Audio Change Mode first ---
     if uid in MKV_AUDIO_CHANGE_MODE:
         await handle_audio_change_file(c, m)
         return
     # -------------------------------------------------
 
     # Fallback to existing logic (Forwarded/direct file for rename/re-upload logic)
-    # The original logic combined forwarded and direct files here. I'll split it slightly
-    # to maintain the original forward logic structure.
 
     # Check if the user is in edit caption mode
     if uid in EDIT_CAPTION_MODE and m.forward_date: # Only apply to forwarded media to avoid accidental re-upload of direct files
@@ -750,7 +857,12 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
                 await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
             except Exception:
                 await m.reply_text("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
-            await process_file_and_upload(c, m, tmp_path, original_name=original_name, messages_to_delete=[status_msg.id])
+                
+            # NEW RENAME FEATURE: ফরওয়ার্ডেড ফাইলের জন্য নাম পরিবর্তন
+            renamed_file = generate_new_filename(original_name)
+            # -------------------------------------------------------
+
+            await process_file_and_upload(c, m, tmp_path, original_name=renamed_file, messages_to_delete=[status_msg.id])
         except Exception as e:
             await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
         finally:
@@ -762,7 +874,7 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
         # A direct video/document which isn't handled by another mode. Pass.
         pass
 
-# --- NEW HANDLER FUNCTION: Handle file in audio change mode ---
+# --- HANDLER FUNCTION: Handle file in audio change mode ---
 async def handle_audio_change_file(c: Client, m: Message):
     uid = m.from_user.id
     file_info = m.video or m.document
@@ -775,10 +887,8 @@ async def handle_audio_change_file(c: Client, m: Message):
     if uid in AUDIO_CHANGE_FILE:
         try:
             Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-            # <--- AUTO-DELETE FIX: Clean up previous prompt message
             if 'message_id' in AUDIO_CHANGE_FILE[uid]:
                 await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-            # -----------------------------------------------------------------
         except Exception:
             pass
         AUDIO_CHANGE_FILE.pop(uid, None)
@@ -787,6 +897,7 @@ async def handle_audio_change_file(c: Client, m: Message):
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
+    tmp_path = None
     try:
         original_name = file_info.file_name or f"video_{file_info.file_unique_id}.mkv"
         # Ensure it has an extension for ffprobe
@@ -798,12 +909,12 @@ async def handle_audio_change_file(c: Client, m: Message):
         status_msg = await m.reply_text("অডিও ট্র্যাক বিশ্লেষণের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
         await m.download(file_name=str(tmp_path))
         
-        # Use FFprobe to get audio tracks (Blocking call, but for a downloaded file, should be fast)
+        # Use FFprobe to get audio tracks
         audio_tracks = await asyncio.to_thread(get_audio_tracks_ffprobe, tmp_path)
         
         if not audio_tracks:
             await status_msg.edit("এই ভিডিওতে কোনো অডিও ট্র্যাক পাওয়া যায়নি বা FFprobe চলতে পারেনি।")
-            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON even on error
             tmp_path.unlink(missing_ok=True)
             return
 
@@ -818,7 +929,6 @@ async def handle_audio_change_file(c: Client, m: Message):
             "আপনি যদি অডিও পরিবর্তন না করতে চান, তাহলে `/mkv_video_audio_change` লিখে মোড অফ করুন।"
         )
         
-        # This message now holds the track list/prompt
         await status_msg.edit(track_list_text) 
         
         # Store file info for the next text message handler
@@ -826,12 +936,14 @@ async def handle_audio_change_file(c: Client, m: Message):
             'path': tmp_path, 
             'original_name': original_name,
             'tracks': audio_tracks,
-            'message_id': status_msg.id # <--- AUTO-DELETE FIX: Store the message ID
+            'message_id': status_msg.id
         }
         
     except Exception as e:
         logger.error(f"Audio track analysis error: {e}")
         await m.reply_text(f"অডিও ট্র্যাক বিশ্লেষণে সমস্যা: {e}")
+        if tmp_path and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
     finally:
         try:
             TASKS[uid].remove(cancel_event)
@@ -839,19 +951,19 @@ async def handle_audio_change_file(c: Client, m: Message):
             pass
 # -----------------------------------------------------
 
-# --- NEW HANDLER FUNCTION: Handle audio remux (FIXED with disposition flags) ---
-# <--- AUTO-DELETE FIX: Added messages_to_delete to the signature
+# --- HANDLER FUNCTION: Handle audio remux ---
 async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list, messages_to_delete: list = None):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
-    # Ensure the output is an MKV file to simplify remuxing
-    out_name = Path(original_name).stem + "_audio_changed.mkv"
+    # NEW RENAME FEATURE: অডিও পরিবর্তন করার পর নতুন নাম সেট করা
+    out_name = generate_new_filename(original_name)
+    # Ensure the output is an MKV file after remuxing
+    if not out_name.lower().endswith(".mkv"):
+        out_name = out_name.split(".")[0] + ".mkv"
+    # ------------------------------------------------------------------
     out_path = TMP / f"remux_{uid}_{int(datetime.now().timestamp())}_{out_name}"
-    
-    # FFmpeg command: remux video (-c:v copy), all subtitles (-c:s copy), and all data streams (-c:d copy),
-    # but map audio tracks in the new order.
     
     map_args = ["-map", "0:v", "-map", "0:s?", "-map", "0:d?"] # 0:s? and 0:d? maps them if they exist
     # Add the user-specified audio maps
@@ -861,9 +973,9 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
     cmd = [
         "ffmpeg",
         "-i", str(in_path),
-        "-disposition:a", "0",            # <-- FIX: সমস্ত অডিও ট্র্যাকের 'Default' ফ্ল্যাগ রিসেট
+        "-disposition:a", "0",            # FIX: সমস্ত অডিও ট্র্যাকের 'Default' ফ্ল্যাগ রিসেট
         *map_args,
-        "-disposition:a:0", "default",    # <-- FIX: নতুন অর্ডারের প্রথম ট্র্যাককে (a:0) ডিফল্ট হিসেবে সেট
+        "-disposition:a:0", "default",    # FIX: নতুন অর্ডারের প্রথম ট্র্যাককে (a:0) ডিফল্ট হিসেবে সেট
         "-c", "copy",
         "-metadata", "handler_name=", # Clear metadata
         str(out_path)
@@ -884,7 +996,6 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
         
         if result.returncode != 0:
             logger.error(f"FFmpeg Remux failed: {result.stderr}")
-            # Ensure the output file is not present after failure
             out_path.unlink(missing_ok=True)
             raise Exception(f"FFmpeg Remux ব্যর্থ হয়েছে। ত্রুটি: {result.stderr[:500]}...")
 
@@ -893,13 +1004,10 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
 
         await status_msg.edit("অডিও পরিবর্তন সম্পন্ন, ফাইল আপলোড করা হচ্ছে...", reply_markup=progress_keyboard())
         
-        # <--- AUTO-DELETE FIX: Combine all messages to delete
         all_messages_to_delete = messages_to_delete if messages_to_delete else []
-        all_messages_to_delete.append(status_msg.id) # Add the current progress message ID
-        # ---------------------------------------------------
+        all_messages_to_delete.append(status_msg.id)
 
         # Proceed to final upload
-        # <--- AUTO-DELETE FIX: Pass the combined list to the final upload step
         await process_file_and_upload(c, m, out_path, original_name=out_name, messages_to_delete=all_messages_to_delete) 
 
     except Exception as e:
@@ -932,6 +1040,9 @@ async def rename_cmd(c, m: Message):
         return
     new_name = m.text.split(None, 1)[1].strip()
     new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
+    
+    # NOTE: /rename is an explicit user command to set a custom name, so we don't apply the auto-rename here.
+    
     await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
 
     cancel_event = asyncio.Event()
@@ -968,15 +1079,13 @@ async def cancel_task_cb(c, cb):
         
         # New: Clean up audio change state if in progress
         if uid in MKV_AUDIO_CHANGE_MODE:
-            MKV_AUDIO_CHANGE_MODE.discard(uid)
+            # We don't clear the mode, but clear the waiting file state if it exists
             if uid in AUDIO_CHANGE_FILE:
-                # <--- AUTO-DELETE FIX: Delete the prompt message on cancel
                 if 'message_id' in AUDIO_CHANGE_FILE[uid]:
                     try:
                         await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
                     except Exception:
                         pass
-                # -----------------------------------------------------------------
                 try:
                     Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
                 except Exception:
@@ -1014,7 +1123,7 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
         try:
             await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
         except Exception:
-            await m.reply_text("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
         # Use simple stream copy first
         cmd = [
             "ffmpeg",
@@ -1031,7 +1140,7 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
             try:
                 await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             except Exception:
-                await m.reply_text("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+                await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             
             # Remove failed output before re-encoding
             out_path.unlink(missing_ok=True) 
@@ -1043,6 +1152,8 @@ async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
                 "-preset", "fast",
                 "-crf", "23",
                 "-c:a", "copy",
+                "-map_metadata", "0", # Keep metadata from input
+                "-movflags", "+faststart", # For MP4
                 str(out_path)
             ]
             result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=False, timeout=3600)
@@ -1177,6 +1288,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     final_caption_template = USER_CAPTIONS.get(uid)
 
     try:
+        # NOTE: original_name is already the desired final name due to changes in calling functions
         final_name = original_name or in_path.name
         
         # সংশোধিত লাইন: Pyrogram-এর ডিটেকশন ব্যর্থ হলেও ফাইলের এক্সটেনশন দেখে ভিডিও হিসেবে চিহ্নিত করবে।
@@ -1201,7 +1313,8 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
                 else:
                     upload_path = mkv_path
-                    final_name = mkv_path.name # Update final name to .mkv
+                    # Since we successfully converted to MKV, the final name must reflect this extension
+                    final_name = Path(final_name).stem + ".mkv" 
         
         thumb_path = USER_THUMBS.get(uid)
         
@@ -1250,6 +1363,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         thumb=thumb_path,
                         duration=duration_sec,
                         supports_streaming=True,
+                        file_name=final_name, # Pass the final name for video uploads
                         parse_mode=ParseMode.MARKDOWN
                     )
                 else:
@@ -1263,7 +1377,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 
                 if messages_to_delete:
                     try:
-                        # <--- AUTO-DELETE FIX: Delete all tracked messages on SUCCESS
+                        # Delete all tracked messages on SUCCESS
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
                     except Exception:
                         pass
