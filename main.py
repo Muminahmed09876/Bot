@@ -21,9 +21,6 @@ import time
 import math
 import logging
 
-# New Import for MongoDB
-from motor.motor_asyncio import AsyncIOMotorClient 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -32,41 +29,29 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
+# New env var from previous code
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME") 
-# NEW ENV VAR: MUST BE SET FOR PERSISTENCE
-MONGO_URI = os.getenv("MONGO_URI") 
 
 TMP = Path("tmp")
 TMP.mkdir(parents=True, exist_ok=True)
 
-# --- DATABASE SETUP ---
-db_client = None
-user_settings = None
-
-if MONGO_URI:
-    try:
-        # Connect to MongoDB asynchronously
-        db_client = AsyncIOMotorClient(MONGO_URI)
-        db = db_client.get_database("BotDatabase") # Use a default database name
-        user_settings = db.get_collection("user_settings")
-        logger.info("MongoDB client initialized.")
-    except Exception as e:
-        logger.error(f"MongoDB initialization failed: {e}")
-        # If DB connection fails, persistence features will be disabled.
-        MONGO_URI = None 
-# ----------------------
-
-# state (In-memory state for temporary/session-specific data)
-# NOTE: All persistent user settings (thumb, caption, modes) are now in MongoDB.
-# Only session-specific/temporary state remains in memory.
+# state
+USER_THUMBS = {}
 TASKS = {}
-SET_THUMB_REQUEST = set() # Remains in-memory (tracks immediate next action)
+SET_THUMB_REQUEST = set()
 SUBSCRIBERS = set()
-SET_CAPTION_REQUEST = set() # Remains in-memory (tracks immediate next action)
+SET_CAPTION_REQUEST = set()
+USER_CAPTIONS = {}
+# New state for dynamic captions
+USER_COUNTERS = {}
+# New state for edit caption mode
+EDIT_CAPTION_MODE = set()
+USER_THUMB_TIME = {}
 
-# --- STATE FOR AUDIO CHANGE (Local file paths must remain in memory) ---
+# --- STATE FOR AUDIO CHANGE ---
+MKV_AUDIO_CHANGE_MODE = set()
 # Stores the path of the downloaded file waiting for audio order
-AUDIO_CHANGE_FILE = {} # MUST REMAIN IN-MEMORY (local file path)
+AUDIO_CHANGE_FILE = {} 
 # ------------------------------
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
@@ -75,42 +60,6 @@ MAX_SIZE = 4 * 1024 * 1024 * 1024
 app = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 flask_app = Flask(__name__)
 
-# ---- DATABASE HELPERS (New) ----
-async def get_user_data(uid: int):
-    """Fetches all settings for a user from MongoDB."""
-    if not user_settings:
-        return {} # Return empty dict if DB is disabled
-    return await user_settings.find_one({"_id": uid}) or {}
-
-async def save_user_data(uid: int, update_data: dict):
-    """Saves/updates specific fields for a user in MongoDB."""
-    if not user_settings:
-        return
-    await user_settings.update_one(
-        {"_id": uid},
-        {"$set": update_data},
-        upsert=True
-    )
-    
-async def delete_user_fields(uid: int, fields: list):
-    """Deletes specific fields for a user in MongoDB."""
-    if not user_settings:
-        return
-    await user_settings.update_one(
-        {"_id": uid},
-        {"$unset": {field: "" for field in fields}}
-    )
-
-async def is_audio_change_mode(uid: int) -> bool:
-    data = await get_user_data(uid)
-    return data.get('audio_change_mode', False)
-
-async def is_edit_caption_mode(uid: int) -> bool:
-    data = await get_user_data(uid)
-    return data.get('edit_caption_mode', False)
-# --------------------------
-
-
 # ---- utilities ----
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
@@ -118,44 +67,60 @@ def is_admin(uid: int) -> bool:
 def is_drive_url(url: str) -> bool:
     return "drive.google.com" in url or "docs.google.com" in url
 
-# Function to safely delete the file
-def delete_file(file_path):
-    try:
-        if file_path and Path(file_path).exists():
-            Path(file_path).unlink()
-    except Exception as e:
-        logger.error(f"Error deleting file {file_path}: {e}")
+def extract_drive_id(url: str) -> str:
+    patterns = [
+        r"/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+        r"open\?id=([a-zA-Z0-9_-]+)",
+        r"https://drive.google.com/file/d/([a-zA-Z0-9_-]+)/"
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
 
-def parse_time(time_str: str) -> int:
-    total_seconds = 0
-    match_s = re.findall(r'(\d+)\s*s', time_str, re.IGNORECASE)
-    match_m = re.findall(r'(\d+)\s*m', time_str, re.IGNORECASE)
-    match_h = re.findall(r'(\d+)\s*h', time_str, re.IGNORECASE)
-
-    if match_s:
-        total_seconds += sum(int(s) for s in match_s)
-    if match_m:
-        total_seconds += sum(int(m) for m in match_m) * 60
-    if match_h:
-        total_seconds += sum(int(h) for h in match_h) * 3600
+# Helper function for consistent renaming
+def generate_new_filename(original_name: str) -> str:
+    """Generates the new standardized filename while preserving the original extension."""
+    BASE_NEW_NAME = "[@TA_HD_Anime] Telegram Channel"
+    file_path = Path(original_name)
+    file_ext = file_path.suffix.lower()
     
-    return total_seconds
+    # Clean up the extension and ensure it starts with a dot
+    file_ext = "." + file_ext.lstrip('.')
+    
+    # If a file like 'video_id' or 'file_id' comes without a proper extension, default to .mp4
+    if not file_ext or file_ext == '.':
+        return BASE_NEW_NAME + ".mp4"
+        
+    return BASE_NEW_NAME + file_ext
 
-# Function to get video duration using ffprobe
 def get_video_duration(file_path: Path) -> int:
     try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-             '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        duration = float(result.stdout.strip())
-        return math.ceil(duration)
-    except Exception as e:
-        logger.error(f"ffprobe error: {e}")
+        parser = createParser(str(file_path))
+        if not parser:
+            return 0
+        with parser:
+            metadata = extractMetadata(parser)
+        if metadata and metadata.has("duration"):
+            return int(metadata.get("duration").total_seconds())
+    except Exception:
         return 0
+    return 0
+
+def parse_time(time_str: str) -> int:
+    """Parses a time string like '5s', '1m', '1h 30s' into seconds."""
+    total_seconds = 0
+    parts = time_str.lower().split()
+    for part in parts:
+        if part.endswith('s'):
+            total_seconds += int(part[:-1])
+        elif part.endswith('m'):
+            total_seconds += int(part[:-1]) * 60
+        elif part.endswith('h'):
+            total_seconds += int(part[:-1]) * 3600
+    return total_seconds
 
 def progress_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_task")]])
@@ -163,33 +128,12 @@ def progress_keyboard():
 def delete_caption_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Delete Caption 🗑️", callback_data="delete_caption")]])
 
-async def set_bot_commands():
-    commands = [
-        BotCommand("start", "Welcome message and commands list"),
-        BotCommand("upload_url", "URL থেকে ডাউনলোড ও আপলোড (admin only)"),
-        BotCommand("setthumb", "থাম্বনেইল সেট করুন (admin only)"),
-        BotCommand("view_thumb", "থাম্বনেইল দেখুন (admin only)"),
-        BotCommand("del_thumb", "থাম্বনেইল মুছে ফেলুন (admin only)"),
-        BotCommand("set_caption", "ক্যাপশন সেট করুন (admin only)"),
-        BotCommand("view_caption", "ক্যাপশন দেখুন (admin only)"),
-        BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট মোড টগল করুন (admin only)"),
-        BotCommand("rename", "ভিডিও রিনেম করুন (reply) (admin only)"),
-        BotCommand("mkv_video_audio_change", "MKV অডিও ট্র্যাক পরিবর্তন (admin only)"),
-        BotCommand("mode_check", "বর্তমান মোড স্ট্যাটাস চেক করুন (admin only)"),
-        BotCommand("broadcast", "ব্রডকাস্ট (admin only)"),
-        BotCommand("help", "সাহায্য"),
-    ]
-    try:
-        await app.set_bot_commands(commands)
-    except Exception as e:
-        logger.warning(f"Set commands error: {e}")
-
 # --- NEW UTILITY: Keyboard for Mode Check ---
-async def mode_check_keyboard(uid: int) -> InlineKeyboardMarkup:
-    audio_status = "✅ ON" if await is_audio_change_mode(uid) else "❌ OFF"
-    caption_status = "✅ ON" if await is_edit_caption_mode(uid) else "❌ OFF"
+def mode_check_keyboard(uid: int) -> InlineKeyboardMarkup:
+    audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+    caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
     
-    # Check if a file is waiting for track order input (remains in-memory)
+    # Check if a file is waiting for track order input
     waiting_status = " (অর্ডার বাকি)" if uid in AUDIO_CHANGE_FILE else ""
     
     keyboard = [
@@ -200,57 +144,145 @@ async def mode_check_keyboard(uid: int) -> InlineKeyboardMarkup:
 # ---------------------------------------------
 
 
-# FFmpeg progress callback (using an external file for progress tracking)
-async def progress_callback(current, total, status_msg: Message, cancel_event: asyncio.Event):
-    if cancel_event.is_set():
-        raise asyncio.CancelledError()
-
-    percent = (current / total) * 100
-    progress_bar = f"{'█' * int(percent // 10)}{'░' * (10 - int(percent // 10))}"
-    
-    # Safely convert bytes to appropriate units
-    def format_bytes(b):
-        if b >= 1024**3:
-            return f"{b / 1024**3:.2f} GB"
-        if b >= 1024**2:
-            return f"{b / 1024**2:.2f} MB"
-        if b >= 1024:
-            return f"{b / 1024:.2f} KB"
-        return f"{b} B"
-
-    # Time calculations
-    if 'start_time' not in status_msg.dict:
-        status_msg.dict['start_time'] = time.time()
-        status_msg.dict['last_edit_time'] = time.time()
-    
-    elapsed = time.time() - status_msg.dict['start_time']
-    
-    if current > 0 and elapsed > 0:
-        speed = current / elapsed
-        eta = (total - current) / speed
-    else:
-        speed = 0
-        eta = 0
-
-    # Avoid excessive editing
-    if time.time() - status_msg.dict['last_edit_time'] > 3 or current == total:
-        status_msg.dict['last_edit_time'] = time.time()
+# --- NEW UTILITY: FFprobe to get audio tracks ---
+def get_audio_tracks_ffprobe(file_path: Path) -> list:
+    """Uses ffprobe to get a list of audio streams with their index and title."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+        metadata = json.loads(result.stdout)
         
-        caption_text = (
-            f"**{status_msg.caption if status_msg.caption else 'Downloading/Uploading...'}**\n"
-            f"Progress: `{progress_bar}`\n"
-            f"Status: **{percent:.2f}%**\n"
-            f"Size: **{format_bytes(current)}** / **{format_bytes(total)}**\n"
-            f"Speed: **{format_bytes(speed)}/s**\n"
-            f"ETA: **{timedelta(seconds=int(eta))}**"
-        )
-        
+        audio_tracks = []
+        for stream in metadata.get('streams', []):
+            if stream.get('codec_type') == 'audio':
+                stream_index = stream.get('index') 
+                title = stream.get('tags', {}).get('title', 'N/A')
+                language = stream.get('tags', {}).get('language', 'und') # 'und' is undefined
+                audio_tracks.append({
+                    'stream_index': stream_index,
+                    'title': title,
+                    'language': language
+                })
+        return audio_tracks
+    except Exception as e:
+        logger.error(f"FFprobe error: {e}")
+        return []
+# ---------------------------------------------
+
+
+# ---- progress callback helpers (removed live progress) ----
+async def progress_callback(current, total, message: Message, start_time, task="Progress"):
+    pass
+
+def pyrogram_progress_wrapper(current, total, message_obj, start_time_obj, task_str="Progress"):
+    pass
+
+# ---- robust download stream with retries ----
+async def download_stream(resp, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+    total = 0
+    try:
+        size = int(resp.headers.get("Content-Length", 0))
+    except:
+        size = 0
+    chunk_size = 1024 * 1024
+    try:
+        with out_path.open("wb") as f:
+            async for chunk in resp.content.iter_chunked(chunk_size):
+                if cancel_event and cancel_event.is_set():
+                    return False, "অপারেশন ব্যবহারকারী দ্বারা বাতিল করা হয়েছে।"
+                if not chunk:
+                    break
+                if total > MAX_SIZE:
+                    return False, "ফাইলের সাইজ 4GB এর বেশি হতে পারে না।"
+                total += len(chunk)
+                f.write(chunk)
+    except Exception as e:
+        return False, str(e)
+    return True, None
+
+async def fetch_with_retries(session, url, method="GET", max_tries=3, **kwargs):
+    backoff = 1
+    for attempt in range(1, max_tries + 1):
         try:
-            await status_msg.edit(caption_text, reply_markup=progress_keyboard())
+            resp = await session.request(method, url, **kwargs)
+            return resp
         except Exception as e:
-            # Handle FloodWait or MessageNotModified
-            if "MESSAGE_NOT_MODIFIED" not in str(e):
-                logger.error(f"Error editing progress message: {e}")
+            if attempt == max_tries:
+                raise
+            await asyncio.sleep(backoff)
+            backoff *= 2
+    raise RuntimeError("unreachable")
+
+async def download_url_generic(url: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+    timeout = aiohttp.ClientTimeout(total=7200)
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+    connector = aiohttp.TCPConnector(limit=0, force_close=True)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as sess:
+        try:
+            async with sess.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return False, f"HTTP {resp.status}"
+                return await download_stream(resp, out_path, message, cancel_event=cancel_event)
+        except Exception as e:
+            return False, str(e)
+
+async def download_drive_file(file_id: str, out_path: Path, message: Message = None, cancel_event: asyncio.Event = None):
+    base = f"https://drive.google.com/uc?export=download&id={file_id}"
+    timeout = aiohttp.ClientTimeout(total=7200)
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+    connector = aiohttp.TCPConnector(limit=0, force_close=True)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as sess:
+        try:
+            async with sess.get(base, allow_redirects=True) as resp:
+                if resp.status == 200 and "content-disposition" in (k.lower() for k in resp.headers.keys()):
+                    return await download_stream(resp, out_path, message, cancel_event=cancel_event)
+                text = await resp.text(errors="ignore")
+                m = re.search(r"confirm=([0-9A-Za-z-_]+)", text)
+                if m:
+                    token = m.group(1)
+                    download_url = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+                    async with sess.get(download_url, allow_redirects=True) as resp2:
+                        if resp2.status != 200:
+                            return False, f"HTTP {resp2.status}"
+                        return await download_stream(resp2, out_path, message, cancel_event=cancel_event)
+                for k, v in resp.cookies.items():
+                    if k.startswith("download_warning"):
+                        token = v.value
+                        download_url = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+                        async with sess.get(download_url, allow_redirects=True) as resp2:
+                            if resp2.status != 200:
+                                return False, f"HTTP {resp2.status}"
+                            return await download_stream(resp2, out_path, message, cancel_event=cancel_event)
+                return False, "ডাউনলোডের জন্য Google Drive থেকে অনুমতি প্রয়োজন বা লিংক পাবলিক নয়।"
+        except Exception as e:
+            return False, str(e)
+
+async def set_bot_commands():
+    cmds = [
+        BotCommand("start", "বট চালু/হেল্প"),
+        BotCommand("upload_url", "URL থেকে ফাইল ডাউনলোড ও আপলোড (admin only)"),
+        BotCommand("setthumb", "কাস্টম থাম্বনেইল সেট করুন (admin only)"),
+        BotCommand("view_thumb", "আপনার থাম্বনেইল দেখুন (admin only)"),
+        BotCommand("del_thumb", "আপনার থাম্বনেইল মুছে ফেলুন (admin only)"),
+        BotCommand("set_caption", "কাস্টম ক্যাপশন সেট করুন (admin only)"),
+        BotCommand("view_caption", "আপনার ক্যাপশন দেখুন (admin only)"),
+        BotCommand("edit_caption_mode", "শুধু ক্যাপশন এডিট করুন (admin only)"),
+        BotCommand("rename", "reply করা ভিডিও রিনেম করুন (admin only)"),
+        BotCommand("mkv_video_audio_change", "MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন (admin only)"),
+        BotCommand("mode_check", "বর্তমান মোড স্ট্যাটাস চেক করুন (admin only)"), # NEW COMMAND
+        BotCommand("broadcast", "ব্রডকাস্ট (কেবল অ্যাডমিন)"),
+        BotCommand("help", "সহায়িকা")
+    ]
+    try:
+        await app.set_bot_commands(cmds)
+    except Exception as e:
+        logger.warning("Set commands error: %s", e)
 
 # ---- handlers ----
 @app.on_message(filters.command("start") & filters.private)
@@ -269,8 +301,8 @@ async def start_handler(c, m: Message):
         "/view_caption - আপনার ক্যাপশন দেখুন (admin only)\n"
         "/edit_caption_mode - শুধু ক্যাপশন এডিট করার মোড টগল করুন (admin only)\n"
         "/rename <newname.ext> - reply করা ভিডিও রিনেম করুন (admin only)\n"
-        "/mkv_video_audio_change - MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন (admin only)\n"
-        "/mode_check - বর্তমান মোড স্ট্যাটাস চেক করুন এবং পরিবর্তন করুন (admin only)\n"
+        "/mkv_video_audio_change - MKV ভিডিওর অডিও ট্র্যাক পরিবর্তন মোড টগল করুন (admin only)\n"
+        "/mode_check - বর্তমান মোড স্ট্যাটাস চেক করুন এবং পরিবর্তন করুন (admin only)\n" # NEW COMMAND in help
         "/broadcast <text> - ব্রডকাস্ট (শুধুমাত্র অ্যাডমিন)\n"
         "/help - সাহায্য"
     )
@@ -291,8 +323,7 @@ async def setthumb_prompt(c, m):
         time_str = " ".join(m.command[1:])
         seconds = parse_time(time_str)
         if seconds > 0:
-            # DB CHANGE: Save thumb_time to MongoDB
-            await save_user_data(uid, {'thumb_time': seconds})
+            USER_THUMB_TIME[uid] = seconds
             await m.reply_text(f"থাম্বনেইল তৈরির সময় সেট হয়েছে: {seconds} সেকেন্ড।")
         else:
             await m.reply_text("সঠিক ফরম্যাটে সময় দিন। উদাহরণ: `/setthumb 5s`, `/setthumb 1m`, `/setthumb 1m 30s`")
@@ -307,11 +338,8 @@ async def view_thumb_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     uid = m.from_user.id
-    
-    # DB CHANGE: Fetch user data
-    user_data = await get_user_data(uid)
-    thumb_path = user_data.get('thumb_path')
-    thumb_time = user_data.get('thumb_time')
+    thumb_path = USER_THUMBS.get(uid)
+    thumb_time = USER_THUMB_TIME.get(uid)
     
     if thumb_path and Path(thumb_path).exists():
         await c.send_photo(chat_id=m.chat.id, photo=thumb_path, caption="এটা আপনার সেভ করা থাম্বনেইল।")
@@ -326,19 +354,18 @@ async def del_thumb_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     uid = m.from_user.id
+    thumb_path = USER_THUMBS.get(uid)
+    if thumb_path and Path(thumb_path).exists():
+        try:
+            Path(thumb_path).unlink()
+        except Exception:
+            pass
+        USER_THUMBS.pop(uid, None)
     
-    # DB CHANGE: Fetch and delete
-    user_data = await get_user_data(uid)
-    thumb_path = user_data.get('thumb_path')
-    thumb_time_set = 'thumb_time' in user_data
+    if uid in USER_THUMB_TIME:
+        USER_THUMB_TIME.pop(uid)
 
-    # Safely delete the local file
-    delete_file(thumb_path)
-    
-    # Remove both fields from DB
-    await delete_user_fields(uid, ['thumb_path', 'thumb_time'])
-
-    if not (thumb_path or thumb_time_set):
+    if not (thumb_path or uid in USER_THUMB_TIME):
         await m.reply_text("আপনার কোনো থাম্বনেইল সেভ করা নেই।")
     else:
         await m.reply_text("আপনার থাম্বনেইল/থাম্বনেইল তৈরির সময় মুছে ফেলা হয়েছে।")
@@ -358,11 +385,9 @@ async def photo_handler(c, m: Message):
             img.thumbnail((320, 320))
             img = img.convert("RGB")
             img.save(out, "JPEG")
-            
-            # DB CHANGE: Save new path and clear time setting
-            await save_user_data(uid, {'thumb_path': str(out)})
-            await delete_user_fields(uid, ['thumb_time'])
-            
+            USER_THUMBS[uid] = str(out)
+            # Make sure to clear the time setting if a photo is set
+            USER_THUMB_TIME.pop(uid, None)
             await m.reply_text("আপনার থাম্বনেইল সেভ হয়েছে।")
         except Exception as e:
             await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
@@ -375,11 +400,9 @@ async def set_caption_prompt(c, m: Message):
     if not is_admin(m.from_user.id):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
-    uid = m.from_user.id
-    SET_CAPTION_REQUEST.add(uid)
-    
-    # DB CHANGE: Reset counter data when a new caption is about to be set
-    await delete_user_fields(uid, ['counters']) 
+    SET_CAPTION_REQUEST.add(m.from_user.id)
+    # Reset counter data when a new caption is about to be set
+    USER_COUNTERS.pop(m.from_user.id, None)
     
     await m.reply_text(
         "ক্যাপশন দিন। এখন আপনি এই কোডগুলো ব্যবহার করতে পারবেন:\n"
@@ -394,11 +417,7 @@ async def view_caption_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     uid = m.from_user.id
-    
-    # DB CHANGE: Fetch caption
-    user_data = await get_user_data(uid)
-    caption = user_data.get('caption')
-    
+    caption = USER_CAPTIONS.get(uid)
     if caption:
         await m.reply_text(f"আপনার সেভ করা ক্যাপশন:\n\n`{caption}`", reply_markup=delete_caption_keyboard())
     else:
@@ -410,11 +429,9 @@ async def delete_caption_cb(c, cb):
     if not is_admin(uid):
         await cb.answer("আপনার অনুমতি নেই।", show_alert=True)
         return
-    
-    # DB CHANGE: Delete caption and counters
-    user_data = await get_user_data(uid)
-    if user_data.get('caption'):
-        await delete_user_fields(uid, ['caption', 'counters'])
+    if uid in USER_CAPTIONS:
+        USER_CAPTIONS.pop(uid)
+        USER_COUNTERS.pop(uid, None) # New: delete counter data
         await cb.message.edit_text("আপনার ক্যাপশন মুছে ফেলা হয়েছে।")
     else:
         await cb.answer("আপনার কোনো ক্যাপশন সেভ করা নেই।", show_alert=True)
@@ -426,16 +443,12 @@ async def toggle_edit_caption_mode(c, m: Message):
     if not is_admin(uid):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
-    
-    is_on = await is_edit_caption_mode(uid)
 
-    if is_on:
-        # DB CHANGE: Set mode to False
-        await save_user_data(uid, {'edit_caption_mode': False})
+    if uid in EDIT_CAPTION_MODE:
+        EDIT_CAPTION_MODE.discard(uid)
         await m.reply_text("edit video caption mod **OFF**.\nএখন থেকে আপলোড করা ভিডিওর রিনেম ও থাম্বনেইল পরিবর্তন হবে, এবং সেভ করা ক্যাপশন যুক্ত হবে।")
     else:
-        # DB CHANGE: Set mode to True
-        await save_user_data(uid, {'edit_caption_mode': True})
+        EDIT_CAPTION_MODE.add(uid)
         await m.reply_text("edit video caption mod **ON**.\nএখন থেকে শুধু সেভ করা ক্যাপশন ভিডিওতে যুক্ত হবে। ভিডিওর নাম এবং থাম্বনেইল একই থাকবে।")
 
 # --- HANDLER: /mkv_video_audio_change ---
@@ -445,17 +458,13 @@ async def toggle_audio_change_mode(c, m: Message):
     if not is_admin(uid):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
-    
-    is_on = await is_audio_change_mode(uid)
 
-    if is_on:
-        # DB CHANGE: Set mode to False
-        await save_user_data(uid, {'audio_change_mode': False})
-        
-        # Clean up any pending file path (in-memory state cleanup)
+    if uid in MKV_AUDIO_CHANGE_MODE:
+        MKV_AUDIO_CHANGE_MODE.discard(uid)
+        # Clean up any pending file path
         if uid in AUDIO_CHANGE_FILE:
             try:
-                delete_file(AUDIO_CHANGE_FILE[uid]['path'])
+                Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
                 if 'message_id' in AUDIO_CHANGE_FILE[uid]:
                     await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
             except Exception:
@@ -463,8 +472,7 @@ async def toggle_audio_change_mode(c, m: Message):
             AUDIO_CHANGE_FILE.pop(uid, None)
         await m.reply_text("MKV অডিও পরিবর্তন মোড **অফ** করা হয়েছে।")
     else:
-        # DB CHANGE: Set mode to True
-        await save_user_data(uid, {'audio_change_mode': True})
+        MKV_AUDIO_CHANGE_MODE.add(uid)
         await m.reply_text("MKV অডিও পরিবর্তন মোড **অন** করা হয়েছে।\nঅনুগ্রহ করে **MKV ফাইল** অথবা অন্য কোনো **ভিডিও ফাইল** পাঠান।\n(এই মোড ম্যানুয়ালি অফ না করা পর্যন্ত চালু থাকবে।)")
 
 # --- NEW HANDLER: /mode_check ---
@@ -475,12 +483,8 @@ async def mode_check_cmd(c, m: Message):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
     
-    # DB CHANGE: Read modes
-    audio_on = await is_audio_change_mode(uid)
-    caption_on = await is_edit_caption_mode(uid)
-    
-    audio_status = "✅ ON" if audio_on else "❌ OFF"
-    caption_status = "✅ ON" if caption_on else "❌ OFF"
+    audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+    caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
     
     waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
     
@@ -494,7 +498,7 @@ async def mode_check_cmd(c, m: Message):
         "নিচের বাটনগুলিতে ক্লিক করে মোড পরিবর্তন করুন।"
     )
     
-    await m.reply_text(status_text, reply_markup=await mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
+    await m.reply_text(status_text, reply_markup=mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
 
 # --- NEW CALLBACK: Mode Toggle Buttons ---
 @app.on_callback_query(filters.regex("toggle_(audio|caption)_mode"))
@@ -507,13 +511,12 @@ async def mode_toggle_callback(c: Client, cb: CallbackQuery):
     action = cb.data
     
     if action == "toggle_audio_mode":
-        is_on = await is_audio_change_mode(uid)
-        if is_on:
+        if uid in MKV_AUDIO_CHANGE_MODE:
             # Turning OFF: Clear mode and cleanup pending file
-            await save_user_data(uid, {'audio_change_mode': False})
+            MKV_AUDIO_CHANGE_MODE.discard(uid)
             if uid in AUDIO_CHANGE_FILE:
                 try:
-                    delete_file(AUDIO_CHANGE_FILE[uid]['path'])
+                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
                     if 'message_id' in AUDIO_CHANGE_FILE[uid]:
                         await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
                 except Exception:
@@ -522,22 +525,21 @@ async def mode_toggle_callback(c: Client, cb: CallbackQuery):
             message = "MKV Audio Change Mode OFF."
         else:
             # Turning ON
-            await save_user_data(uid, {'audio_change_mode': True})
+            MKV_AUDIO_CHANGE_MODE.add(uid)
             message = "MKV Audio Change Mode ON."
             
     elif action == "toggle_caption_mode":
-        is_on = await is_edit_caption_mode(uid)
-        if is_on:
-            await save_user_data(uid, {'edit_caption_mode': False})
+        if uid in EDIT_CAPTION_MODE:
+            EDIT_CAPTION_MODE.discard(uid)
             message = "Edit Caption Mode OFF."
         else:
-            await save_user_data(uid, {'edit_caption_mode': True})
+            EDIT_CAPTION_MODE.add(uid)
             message = "Edit Caption Mode ON."
             
     # Refresh the keyboard and edit the original message (similar to mode_check_cmd)
     try:
-        audio_status = "✅ ON" if await is_audio_change_mode(uid) else "❌ OFF"
-        caption_status = "✅ ON" if await is_edit_caption_mode(uid) else "❌ OFF"
+        audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
+        caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
         
         waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
 
@@ -551,7 +553,7 @@ async def mode_toggle_callback(c: Client, cb: CallbackQuery):
             "নিচের বাটনগুলিতে ক্লিক করে মোড পরিবর্তন করুন।"
         )
         
-        await cb.message.edit_text(status_text, reply_markup=await mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
+        await cb.message.edit_text(status_text, reply_markup=mode_check_keyboard(uid), parse_mode=ParseMode.MARKDOWN)
         await cb.answer(message, show_alert=True)
     except Exception as e:
         logger.error(f"Callback edit error: {e}")
@@ -568,17 +570,17 @@ async def text_handler(c, m: Message):
     # Handle set caption request
     if uid in SET_CAPTION_REQUEST:
         SET_CAPTION_REQUEST.discard(uid)
-        # DB CHANGE: Save caption and reset counter
-        await save_user_data(uid, {'caption': text})
-        await delete_user_fields(uid, ['counters']) 
+        USER_CAPTIONS[uid] = text
+        USER_COUNTERS.pop(uid, None) # New: reset counter on new caption set
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
 
     # --- Handle audio order input if in mode and file is set ---
-    if await is_audio_change_mode(uid) and uid in AUDIO_CHANGE_FILE:
+    if uid in MKV_AUDIO_CHANGE_MODE and uid in AUDIO_CHANGE_FILE:
         file_data = AUDIO_CHANGE_FILE.get(uid)
         if not file_data or not file_data.get('tracks'):
             await m.reply_text("অডিও ট্র্যাকের তথ্য পাওয়া যায়নি। প্রক্রিয়া বাতিল করা হচ্ছে।")
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
 
@@ -609,7 +611,7 @@ async def text_handler(c, m: Message):
             # Start the audio remux process
             asyncio.create_task(
                 handle_audio_remux(
-                    c, m, Path(file_data['path']), 
+                    c, m, file_data['path'], 
                     file_data['original_name'], 
                     new_stream_map, 
                     messages_to_delete=[track_list_message_id, m.id]
@@ -617,6 +619,7 @@ async def text_handler(c, m: Message):
             )
 
             # Clear state immediately
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
             AUDIO_CHANGE_FILE.pop(uid, None) # Clear only the waiting file state
             return
 
@@ -626,6 +629,7 @@ async def text_handler(c, m: Message):
         except Exception as e:
             logger.error(f"Audio remux preparation error: {e}")
             await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া শুরু করতে সমস্যা: {e}")
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
     # -----------------------------------------------------
@@ -640,114 +644,88 @@ async def upload_url_cmd(c, m: Message):
     if not is_admin(m.from_user.id):
         await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
         return
-    
     if not m.command or len(m.command) < 2:
         await m.reply_text("ব্যবহার: /upload_url <url>\nউদাহরণ: /upload_url https://example.com/file.mp4")
         return
     url = m.text.split(None, 1)[1].strip()
     asyncio.create_task(handle_url_download_and_upload(c, m, url))
 
-# Utility function for URL downloading (re-used from original code)
-async def download_file(url, out_path, status_msg, cancel_event):
-    logger.info(f"Downloading from: {url}")
-    file_size = 0
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return False, f"HTTP Error: {response.status}"
-                
-                if cancel_event.is_set():
-                    return False, "Cancelled"
-
-                file_size = int(response.headers.get('content-length', 0))
-                if file_size > MAX_SIZE:
-                    return False, f"ফাইল সাইজ {file_size/1024/1024/1024:.2f} GB যা {MAX_SIZE/1024/1024/1024} GB এর বেশি। বাতিল করা হলো।"
-
-                current = 0
-                chunk_size = 1024 * 1024 * 5 # 5MB chunk
-                with open(out_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(chunk_size):
-                        if cancel_event.is_set():
-                            return False, "Cancelled"
-                        f.write(chunk)
-                        current += len(chunk)
-                        await progress_callback(current, file_size, status_msg, cancel_event)
-        
-        if file_size == 0 and out_path.stat().st_size == 0:
-             return False, "Download failed or file size is zero."
-
-        return True, None
-    except asyncio.CancelledError:
-        delete_file(out_path)
-        return False, "Cancelled by user"
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        delete_file(out_path)
-        return False, str(e)
-
 async def handle_url_download_and_upload(c: Client, m: Message, url: str):
     uid = m.from_user.id
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
 
-    status_msg = None
-    in_path = None
-    
     try:
-        original_name = url.split('/')[-1]
-        
-        # Simple name cleaning for files without clear extension
-        if '.' not in original_name:
-            original_name = "downloaded_file"
+        status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+    try:
+        fname = url.split("/")[-1].split("?")[0] or f"download_{int(datetime.now().timestamp())}"
+        safe_name = re.sub(r"[\\/*?\"<>|:]", "_", fname)
 
-        in_path = TMP / f"{uid}_{datetime.now().timestamp()}_{original_name}"
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
+        if not any(safe_name.lower().endswith(ext) for ext in video_exts):
+            safe_name += ".mp4"
+
+        tmp_in = TMP / f"dl_{uid}_{int(datetime.now().timestamp())}_{safe_name}"
+        ok, err = False, None
         
         try:
-            status_msg = await m.reply_text(f"ডাউনলোড শুরু হচ্ছে...\nURL: `{url}`", reply_markup=progress_keyboard())
+            await status_msg.edit("ডাউনলোড হচ্ছে...", reply_markup=progress_keyboard())
         except Exception:
-            status_msg = await m.reply_text(f"ডাউনলোড শুরু হচ্ছে...\nURL: `{url}`", reply_markup=progress_keyboard())
+            status_msg = await m.reply_text("ডাউনলোড হচ্ছে...", reply_markup=progress_keyboard())
 
-        ok, err = await download_file(url, in_path, status_msg, cancel_event)
-        
+        if is_drive_url(url):
+            fid = extract_drive_id(url)
+            if not fid:
+                try:
+                    await status_msg.edit("Google Drive লিঙ্ক থেকে file id পাওয়া যায়নি। সঠিক লিংক দিন।", reply_markup=None)
+                except Exception:
+                    await m.reply_text("Google Drive লিঙ্ক থেকে file id পাওয়া যায়নি। সঠিক লিংক দিন।", reply_markup=None)
+                TASKS[uid].remove(cancel_event)
+                return
+            ok, err = await download_drive_file(fid, tmp_in, status_msg, cancel_event=cancel_event)
+        else:
+            ok, err = await download_url_generic(url, tmp_in, status_msg, cancel_event=cancel_event)
+
         if not ok:
-            if err == "Cancelled by user":
-                await status_msg.edit("ডাউনলোড বাতিল করা হয়েছে।", reply_markup=None)
-            else:
+            try:
                 await status_msg.edit(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
+            except Exception:
+                await m.reply_text(f"ডাউনলোড ব্যর্থ: {err}", reply_markup=None)
+            try:
+                if tmp_in.exists():
+                    tmp_in.unlink()
+            except:
+                pass
+            TASKS[uid].remove(cancel_event)
             return
 
-        # Start upload process
-        await status_msg.edit("ডাউনলোড সম্পন্ন। এখন আপলোড প্রক্রিয়া শুরু হচ্ছে...", reply_markup=progress_keyboard())
-
-        # Process and Upload
-        await process_file_and_upload(c, m, in_path, original_name=original_name, messages_to_delete=[status_msg.id])
-
-    except Exception as e:
-        logger.error(f"Main download/upload task error: {e}")
-        error_msg = f"প্রক্রিয়াকরণে অপ্রত্যাশিত ত্রুটি: {e}"
         try:
-            if status_msg:
-                await status_msg.edit(error_msg, reply_markup=None)
-            else:
-                await m.reply_text(error_msg)
+            await status_msg.edit("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
         except Exception:
-            await m.reply_text(error_msg)
+            await m.reply_text("ডাউনলোড সম্পন্ন, Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            
+        # NEW RENAME FEATURE: URL আপলোডের জন্য নাম পরিবর্তন
+        renamed_file = generate_new_filename(safe_name)
+        # -------------------------------------------------------
+
+        await process_file_and_upload(c, m, tmp_in, original_name=renamed_file, messages_to_delete=[status_msg.id])
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            await status_msg.edit(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
+        except Exception:
+            await m.reply_text(f"অপস! কিছু ভুল হয়েছে: {e}", reply_markup=None)
     finally:
         try:
-            delete_file(in_path)
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
 
-
 async def handle_caption_only_upload(c: Client, m: Message):
     uid = m.from_user.id
-    
-    # DB CHANGE: Get user data and caption
-    user_data = await get_user_data(uid)
-    caption_to_use = user_data.get('caption')
-    
+    caption_to_use = USER_CAPTIONS.get(uid)
     if not caption_to_use:
         await m.reply_text("ক্যাপশন এডিট মোড চালু আছে কিন্তু কোনো সেভ করা ক্যাপশন নেই। /set_caption দিয়ে ক্যাপশন সেট করুন।")
         return
@@ -771,26 +749,46 @@ async def handle_caption_only_upload(c: Client, m: Message):
                 await m.reply_text("এটি একটি ভিডিও বা ডকুমেন্ট ফাইল নয়।")
             return
         
-        # DB CHANGE: Process the dynamic caption (now an async function)
-        final_caption = await process_dynamic_caption(uid, caption_to_use, user_data)
+        # Process the dynamic caption
+        final_caption = process_dynamic_caption(uid, caption_to_use)
         
         if file_info.file_id:
-            if source_message.video:
-                 # Edit the video message caption
-                await c.edit_message_caption(
-                    chat_id=m.chat.id,
-                    message_id=source_message.id,
-                    caption=final_caption,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            elif source_message.document:
-                 # Edit the document message caption
-                await c.edit_message_caption(
-                    chat_id=m.chat.id,
-                    message_id=source_message.id,
-                    caption=final_caption,
-                    parse_mode=ParseMode.MARKDOWN
-                )
+            try:
+                if source_message.video:
+                    await c.send_video(
+                        chat_id=m.chat.id,
+                        video=file_info.file_id,
+                        caption=final_caption,
+                        thumb=file_info.thumbs[0].file_id if file_info.thumbs else None,
+                        duration=file_info.duration,
+                        supports_streaming=True,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                elif source_message.document:
+                    await c.send_document(
+                        chat_id=m.chat.id,
+                        document=file_info.file_id,
+                        file_name=file_info.file_name,
+                        caption=final_caption,
+                        thumb=file_info.thumbs[0].file_id if file_info.thumbs else None,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    await status_msg.edit(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
+                except Exception:
+                    await m.reply_text(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
+                return
+        else:
+            try:
+                await status_msg.edit("ফাইলের ফাইল আইডি পাওয়া যায়নি।", reply_markup=None)
+            except Exception:
+                await m.reply_text("ফাইলের ফাইল আইডি পাওয়া যায়নি।", reply_markup=None)
+            return
         
         # New code to auto-delete the success message
         try:
@@ -802,13 +800,8 @@ async def handle_caption_only_upload(c: Client, m: Message):
             await asyncio.sleep(5)
             await success_msg.delete()
 
-    except asyncio.CancelledError:
-        try:
-            await status_msg.edit("ক্যাপশন এডিট বাতিল করা হয়েছে।", reply_markup=None)
-        except Exception:
-            pass
     except Exception as e:
-        logger.error(f"Caption only upload error: {e}")
+        traceback.print_exc()
         try:
             await status_msg.edit(f"ক্যাপশন এডিটে ত্রুটি: {e}", reply_markup=None)
         except Exception:
@@ -825,65 +818,58 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
     if not is_admin(uid):
         return
 
-    # --- Check for MKV Audio Change Mode first (DB CHANGE) ---
-    if await is_audio_change_mode(uid):
+    # --- Check for MKV Audio Change Mode first ---
+    if uid in MKV_AUDIO_CHANGE_MODE:
         await handle_audio_change_file(c, m)
         return
     # -------------------------------------------------
 
-    # Check if the user is in edit caption mode (DB CHANGE)
-    if await is_edit_caption_mode(uid) and m.forward_date: # Only apply to forwarded media to avoid accidental re-upload of direct files
+    # Fallback to existing logic (Forwarded/direct file for rename/re-upload logic)
+
+    # Check if the user is in edit caption mode
+    if uid in EDIT_CAPTION_MODE and m.forward_date: # Only apply to forwarded media to avoid accidental re-upload of direct files
         await handle_caption_only_upload(c, m)
         return
 
     # If not in any special mode, and it's a forwarded video/document, start the download/re-upload process
     if m.forward_date:
-        if m.video or m.document:
-            cancel_event = asyncio.Event()
-            TASKS.setdefault(uid, []).append(cancel_event)
-            
-            status_msg = None
-            in_path = None
-            
+        # Original logic for forwarded file handling
+        cancel_event = asyncio.Event()
+        TASKS.setdefault(uid, []).append(cancel_event)
+        
+        file_info = m.video or m.document
+        
+        if file_info and file_info.file_name:
+            original_name = file_info.file_name
+        elif m.video:
+            original_name = f"video_{file_info.file_unique_id}.mp4"
+        else:
+            original_name = f"file_{file_info.file_unique_id}"
+
+        try:
+            status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            status_msg = await m.reply_text("ফরওয়ার্ড করা ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        tmp_path = TMP / f"forwarded_{uid}_{int(datetime.now().timestamp())}_{original_name}"
+        try:
+            await m.download(file_name=str(tmp_path))
             try:
-                status_msg = await m.reply_text("ফাইল ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+                await status_msg.edit("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
+            except Exception:
+                await m.reply_text("ডাউনলোড সম্পন্ন, এখন Telegram-এ আপলোড হচ্ছে...", reply_markup=None)
                 
-                in_path = await c.download_media(
-                    message=m,
-                    file_name=str(TMP / f"{uid}_{datetime.now().timestamp()}_{m.video.file_name if m.video else m.document.file_name}"),
-                    progress=progress_callback,
-                    progress_args=(status_msg, cancel_event)
-                )
+            # NEW RENAME FEATURE: ফরওয়ার্ডেড ফাইলের জন্য নাম পরিবর্তন
+            renamed_file = generate_new_filename(original_name)
+            # -------------------------------------------------------
 
-                if cancel_event.is_set():
-                    await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-                    return
-
-                await status_msg.edit("ডাউনলোড সম্পন্ন। এখন আপলোড প্রক্রিয়া শুরু হচ্ছে...", reply_markup=progress_keyboard())
-
-                original_name = m.video.file_name if m.video else m.document.file_name
-
-                # Process and Upload
-                await process_file_and_upload(c, m, Path(in_path), original_name=original_name, messages_to_delete=[status_msg.id])
-
-            except asyncio.CancelledError:
-                await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-            except Exception as e:
-                logger.error(f"Forwarded file upload error: {e}")
-                error_msg = f"প্রক্রিয়াকরণে অপ্রত্যাশিত ত্রুটি: {e}"
-                try:
-                    if status_msg:
-                        await status_msg.edit(error_msg, reply_markup=None)
-                    else:
-                        await m.reply_text(error_msg)
-                except Exception:
-                    await m.reply_text(error_msg)
-            finally:
-                try:
-                    delete_file(in_path)
-                    TASKS[uid].remove(cancel_event)
-                except Exception:
-                    pass
+            await process_file_and_upload(c, m, tmp_path, original_name=renamed_file, messages_to_delete=[status_msg.id])
+        except Exception as e:
+            await m.reply_text(f"ফাইল প্রসেসিংয়ে সমস্যা: {e}")
+        finally:
+            try:
+                TASKS[uid].remove(cancel_event)
+            except Exception:
+                pass
     else:
         # A direct video/document which isn't handled by another mode. Pass.
         pass
@@ -891,131 +877,79 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
 # --- HANDLER FUNCTION: Handle file in audio change mode ---
 async def handle_audio_change_file(c: Client, m: Message):
     uid = m.from_user.id
-    
     file_info = m.video or m.document
+    
     if not file_info:
-        await m.reply_text("MKV অডিও পরিবর্তন মোড চালু আছে। অনুগ্রহ করে একটি ভিডিও/ডকুমেন্ট ফাইল পাঠান।")
+        await m.reply_text("এটি একটি ভিডিও ফাইল নয়।")
         return
 
-    # Clear any previous pending file (in-memory state cleanup)
+    # If there's already a file waiting for audio order, cancel the previous one
     if uid in AUDIO_CHANGE_FILE:
         try:
-            delete_file(AUDIO_CHANGE_FILE[uid]['path'])
+            Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
             if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                 await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+                await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
         except Exception:
             pass
         AUDIO_CHANGE_FILE.pop(uid, None)
-
+    
+    # Download the file
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
-    status_msg = None
-    in_path = None
-
+    tmp_path = None
     try:
-        original_name = file_info.file_name if file_info.file_name else f"file_{file_info.file_unique_id}"
-        in_path = TMP / f"{uid}_{datetime.now().timestamp()}_{original_name}"
-        
-        try:
-            status_msg = await m.reply_text("অডিও ট্র্যাক বিশ্লেষণের জন্য ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
-        except Exception:
-            status_msg = await m.reply_text("অডিও ট্র্যাক বিশ্লেষণের জন্য ডাউনলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
-
-        in_path = await c.download_media(
-            message=m,
-            file_name=str(in_path),
-            progress=progress_callback,
-            progress_args=(status_msg, cancel_event)
-        )
-
-        if cancel_event.is_set():
-            await status_msg.edit("ডাউনলোড বাতিল করা হয়েছে।", reply_markup=None)
-            return
-
-        # Check for MKV format and extract audio streams
-        if Path(in_path).suffix.lower() not in ['.mkv', '.mp4']:
-            await status_msg.edit("এই মোডটি শুধুমাত্র MKV এবং MP4 ফাইলের জন্য উপযুক্ত। প্রক্রিয়া বাতিল করা হলো।", reply_markup=None)
-            return
+        original_name = file_info.file_name or f"video_{file_info.file_unique_id}.mkv"
+        # Ensure it has an extension for ffprobe
+        if not '.' in original_name:
+            original_name += '.mkv'
             
-        # Get audio track info using ffprobe
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 
-             'stream=index:codec_name:tags=language', '-of', 'json', str(in_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        tmp_path = TMP / f"audio_change_{uid}_{int(datetime.now().timestamp())}_{original_name}"
+        
+        status_msg = await m.reply_text("অডিও ট্র্যাক বিশ্লেষণের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+        await m.download(file_name=str(tmp_path))
+        
+        # Use FFprobe to get audio tracks
+        audio_tracks = await asyncio.to_thread(get_audio_tracks_ffprobe, tmp_path)
+        
+        if not audio_tracks:
+            await status_msg.edit("এই ভিডিওতে কোনো অডিও ট্র্যাক পাওয়া যায়নি বা FFprobe চলতে পারেনি।")
+            # MKV_AUDIO_CHANGE_MODE.discard(uid) # <--- REMOVED: Keep mode ON even on error
+            tmp_path.unlink(missing_ok=True)
+            return
+
+        # Prepare and send the track list
+        track_list_text = "ফাইলের অডিও ট্র্যাকসমূহ:\n\n"
+        for i, track in enumerate(audio_tracks, 1):
+            track_list_text += f"{i}. **Stream Index:** {track['stream_index']}, **Language:** {track['language']}, **Title:** {track['title']}\n"
+            
+        track_list_text += (
+            "\nএখন আপনি কোন অডিও ট্র্যাকটি প্রথমে (primary) চান, সেই অনুযায়ী ট্র্যাক নম্বর (উপরে ১, ২, ৩...) কমা-সেপারেটেড সংখ্যায় দিন।\n"
+            "যেমন, যদি আপনি ৩য় ট্র্যাকটি প্রথমে, ২য়টি দ্বিতীয় এবং ১মটি তৃতীয়তে চান, তাহলে লিখুন: `3,2,1`\n"
+            "আপনি যদি অডিও পরিবর্তন না করতে চান, তাহলে `/mkv_video_audio_change` লিখে মোড অফ করুন।"
         )
         
-        if result.returncode != 0:
-            await status_msg.edit(f"FFprobe ত্রুটি: অডিও ট্র্যাক বিশ্লেষণ করা সম্ভব হয়নি।\n{result.stderr}", reply_markup=None)
-            return
-
-        tracks_data = json.loads(result.stdout).get('streams', [])
+        await status_msg.edit(track_list_text) 
         
-        if not tracks_data:
-            await status_msg.edit("ফাইলটিতে কোনো অডিও ট্র্যাক পাওয়া যায়নি। প্রক্রিয়া বাতিল করা হলো।", reply_markup=None)
-            return
-            
-        track_list = []
-        for i, stream in enumerate(tracks_data):
-            language = stream.get('tags', {}).get('language', 'N/A')
-            codec = stream.get('codec_name', 'N/A')
-            # Storing the actual FFmpeg index for mapping
-            track_list.append({
-                'user_index': i + 1,
-                'stream_index': stream.get('index'),
-                'details': f"({i+1}) - {language} ({codec})"
-            })
-            
-        track_message = (
-            "**অডিও ট্র্যাকের তালিকা:**\n"
-            "----------------------------\n"
-            + "\n".join([t['details'] for t in track_list]) + "\n"
-            "----------------------------\n"
-            f"মোট ট্র্যাক: {len(track_list)}\n\n"
-            "আপনি যে অর্ডারে ট্র্যাকগুলি রাখতে চান, সেই অর্ডারে কমা-সেপারেটেড সংখ্যাগুলো টাইপ করে পাঠান।\n"
-            "উদাহরণ: যদি আপনি ৩য় ট্র্যাকটি প্রথমে, ২য় ট্র্যাকটি দ্বিতীয়তে, এবং ১ম ট্র্যাকটি শেষে চান, তবে লিখুন: `3,2,1`"
-        )
-        
-        # Send the track list and save the file info for the next step
-        track_msg = await c.send_message(m.chat.id, track_message)
-        
+        # Store file info for the next text message handler
         AUDIO_CHANGE_FILE[uid] = {
-            'path': str(in_path),
+            'path': tmp_path, 
             'original_name': original_name,
-            'tracks': track_list,
-            'message_id': track_msg.id # To delete later
+            'tracks': audio_tracks,
+            'message_id': status_msg.id
         }
-
-        # Delete the download status message
-        await status_msg.delete()
         
-    except asyncio.CancelledError:
-        try:
-            if status_msg:
-                await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-        except Exception:
-            pass
-        delete_file(in_path)
     except Exception as e:
-        logger.error(f"Audio change mode initial handler error: {e}")
-        error_msg = f"অডিও ট্র্যাক বিশ্লেষণে ত্রুটি: {e}"
-        try:
-            if status_msg:
-                await status_msg.edit(error_msg, reply_markup=None)
-            else:
-                await m.reply_text(error_msg)
-        except Exception:
-            await m.reply_text(error_msg)
-        delete_file(in_path)
-        
+        logger.error(f"Audio track analysis error: {e}")
+        await m.reply_text(f"অডিও ট্র্যাক বিশ্লেষণে সমস্যা: {e}")
+        if tmp_path and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
     finally:
         try:
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
-
+# -----------------------------------------------------
 
 # --- HANDLER FUNCTION: Handle audio remux ---
 async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name: str, new_stream_map: list, messages_to_delete: list = None):
@@ -1023,137 +957,112 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
     
-    status_msg = None
-    out_path = TMP / f"{in_path.stem}_remux.mkv"
-    messages_to_delete = messages_to_delete or []
+    # NEW RENAME FEATURE: অডিও পরিবর্তন করার পর নতুন নাম সেট করা
+    out_name = generate_new_filename(original_name)
+    # Ensure the output is an MKV file after remuxing
+    if not out_name.lower().endswith(".mkv"):
+        out_name = out_name.split(".")[0] + ".mkv"
+    # ------------------------------------------------------------------
+    out_path = TMP / f"remux_{uid}_{int(datetime.now().timestamp())}_{out_name}"
+    
+    map_args = ["-map", "0:v", "-map", "0:s?", "-map", "0:d?"] # 0:s? and 0:d? maps them if they exist
+    # Add the user-specified audio maps
+    for stream_index in new_stream_map:
+        map_args.extend(["-map", stream_index])
+        
+    cmd = [
+        "ffmpeg",
+        "-i", str(in_path),
+        "-disposition:a", "0",            # FIX: সমস্ত অডিও ট্র্যাকের 'Default' ফ্ল্যাগ রিসেট
+        *map_args,
+        "-disposition:a:0", "default",    # FIX: নতুন অর্ডারের প্রথম ট্র্যাককে (a:0) ডিফল্ট হিসেবে সেট
+        "-c", "copy",
+        "-metadata", "handler_name=", # Clear metadata
+        str(out_path)
+    ]
 
     try:
-        map_args = sum([['-map', map_entry] for map_entry in new_stream_map], [])
+        status_msg = await m.reply_text("অডিও ট্র্যাক অর্ডার পরিবর্তন করা হচ্ছে (Remuxing)...", reply_markup=progress_keyboard())
         
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-i', str(in_path), 
-            '-map', '0:v', # Always map the video stream
-        ] + map_args + [
-            '-c', 'copy', # Copy all streams
-            '-c:a', 'copy', # Redundant, but ensures audio is copied
-            '-metadata', 'title="Remuxed"', # Optional metadata
-            '-y', str(out_path) # Output file
-        ]
-
-        logger.info(f"FFmpeg Remux Command: {' '.join(ffmpeg_cmd)}")
-        
-        status_msg = await m.reply_text("অডিও ট্র্যাক পরিবর্তন করা হচ্ছে (Remuxing)...", reply_markup=progress_keyboard())
-        messages_to_delete.append(status_msg.id)
-
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        # Run the FFmpeg command
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3600
         )
         
-        # Simple wait for the process to finish
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            error_details = stderr.decode().strip()
-            await status_msg.edit(f"অডিও ট্র্যাক পরিবর্তন ব্যর্থ: FFmpeg ত্রুটি।\nবিস্তারিত: {error_details}", reply_markup=None)
-            return
+        if result.returncode != 0:
+            logger.error(f"FFmpeg Remux failed: {result.stderr}")
+            out_path.unlink(missing_ok=True)
+            raise Exception(f"FFmpeg Remux ব্যর্থ হয়েছে। ত্রুটি: {result.stderr[:500]}...")
 
-        await status_msg.edit("ট্র্যাক পরিবর্তন সম্পন্ন। এখন আপলোড শুরু হচ্ছে...", reply_markup=progress_keyboard())
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise Exception("পরিবর্তিত ফাইলটি পাওয়া যায়নি বা শূন্য আকারের।")
 
-        # Start upload process with the remuxed file
-        final_name = Path(original_name).stem + out_path.suffix
-        await process_file_and_upload(c, m, out_path, original_name=final_name, messages_to_delete=messages_to_delete)
+        await status_msg.edit("অডিও পরিবর্তন সম্পন্ন, ফাইল আপলোড করা হচ্ছে...", reply_markup=progress_keyboard())
         
-    except asyncio.CancelledError:
+        all_messages_to_delete = messages_to_delete if messages_to_delete else []
+        all_messages_to_delete.append(status_msg.id)
+
+        # Proceed to final upload
+        await process_file_and_upload(c, m, out_path, original_name=out_name, messages_to_delete=all_messages_to_delete) 
+
+    except Exception as e:
+        logger.error(f"Audio remux process error: {e}")
         try:
-            if status_msg:
-                await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
+            await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া ব্যর্থ: {e}")
         except Exception:
             pass
-    except Exception as e:
-        logger.error(f"Audio remux handler error: {e}")
-        error_msg = f"অডিও ট্র্যাক পরিবর্তন ও আপলোডে ত্রুটি: {e}"
-        try:
-            if status_msg:
-                await status_msg.edit(error_msg, reply_markup=None)
-            else:
-                await m.reply_text(error_msg)
-        except Exception:
-            await m.reply_text(error_msg)
-            
     finally:
         try:
-            delete_file(in_path)
-            delete_file(out_path)
+            in_path.unlink(missing_ok=True)
+            out_path.unlink(missing_ok=True)
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
+# ---------------------------------------------------
 
 
 @app.on_message(filters.command("rename") & filters.private)
 async def rename_cmd(c, m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply_text("আপনার অনুমতি নেই এই কমান্ড চালানোর।")
-        return
-    
-    if not m.reply_to_message:
-        await m.reply_text("একটি ফাইল বা ভিডিওতে রিপ্লাই করে কমান্ডটি ব্যবহার করুন।")
-        return
-
-    if not m.command or len(m.command) < 2:
-        await m.reply_text("ব্যবহার: /rename <newname.ext>")
-        return
-        
-    new_name = m.text.split(None, 1)[1].strip()
-    
     uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই।")
+        return
+    if not m.reply_to_message or not (m.reply_to_message.video or m.reply_to_message.document):
+        await m.reply_text("ভিডিও/ডকুমেন্ট ফাইলের reply দিয়ে এই কমান্ড দিন।\nUsage: /rename new_name.mp4")
+        return
+    if len(m.command) < 2:
+        await m.reply_text("নতুন ফাইল নাম দিন। উদাহরণ: /rename new_video.mp4")
+        return
+    new_name = m.text.split(None, 1)[1].strip()
+    new_name = re.sub(r"[\\/*?\"<>|:]", "_", new_name)
+    
+    # NOTE: /rename is an explicit user command to set a custom name, so we don't apply the auto-rename here.
+    
+    await m.reply_text(f"ভিডিও রিনেম করা হবে: {new_name}\n(রিনেম করতে reply করা ফাইলটি পুনরায় ডাউনলোড করে আপলোড করা হবে)")
+
     cancel_event = asyncio.Event()
     TASKS.setdefault(uid, []).append(cancel_event)
-    
-    status_msg = None
-    in_path = None
-    
     try:
-        status_msg = await m.reply_text("রিনেম করার জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
-        
-        file_info = m.reply_to_message.video or m.reply_to_message.document
-        if not file_info:
-            await status_msg.edit("এটি একটি ভিডিও বা ডকুমেন্ট ফাইল নয়।")
-            return
-
-        in_path = await c.download_media(
-            message=m.reply_to_message,
-            file_name=str(TMP / f"{uid}_{datetime.now().timestamp()}_{file_info.file_name or 'file'}"),
-            progress=progress_callback,
-            progress_args=(status_msg, cancel_event)
-        )
-
-        if cancel_event.is_set():
-            await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-            return
-
-        await status_msg.edit("ডাউনলোড সম্পন্ন। এখন আপলোড প্রক্রিয়া শুরু হচ্ছে...", reply_markup=progress_keyboard())
-
-        # Process and Upload
-        await process_file_and_upload(c, m, Path(in_path), original_name=new_name, messages_to_delete=[status_msg.id])
-
-    except asyncio.CancelledError:
-        await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-    except Exception as e:
-        logger.error(f"Rename command error: {e}")
-        error_msg = f"রিনেম প্রক্রিয়াকরণে অপ্রত্যাশিত ত্রুটি: {e}"
+        status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+    except Exception:
+        status_msg = await m.reply_text("রিনেমের জন্য ফাইল ডাউনলোড করা হচ্ছে...", reply_markup=progress_keyboard())
+    tmp_out = TMP / f"rename_{uid}_{int(datetime.now().timestamp())}_{new_name}"
+    try:
+        await m.reply_to_message.download(file_name=str(tmp_out))
         try:
-            if status_msg:
-                await status_msg.edit(error_msg, reply_markup=None)
-            else:
-                await m.reply_text(error_msg)
+            await status_msg.edit("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
         except Exception:
-            await m.reply_text(error_msg)
+            await m.reply_text("ডাউনলোড সম্পন্ন, এখন নতুন নাম দিয়ে আপলোড হচ্ছে...", reply_markup=None)
+        await process_file_and_upload(c, m, tmp_out, original_name=new_name, messages_to_delete=[status_msg.id])
+    except Exception as e:
+        await m.reply_text(f"রিনেম ত্রুটি: {e}")
     finally:
         try:
-            delete_file(in_path)
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
@@ -1169,16 +1078,16 @@ async def cancel_task_cb(c, cb):
                 pass
         
         # New: Clean up audio change state if in progress
-        if await is_audio_change_mode(uid):
-            # We don't clear the mode (DB), but clear the waiting file state if it exists (in-memory)
+        if uid in MKV_AUDIO_CHANGE_MODE:
+            # We don't clear the mode, but clear the waiting file state if it exists
             if uid in AUDIO_CHANGE_FILE:
+                if 'message_id' in AUDIO_CHANGE_FILE[uid]:
+                    try:
+                        await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
+                    except Exception:
+                        pass
                 try:
-                    delete_file(AUDIO_CHANGE_FILE[uid]['path'])
-                    if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                        try:
-                            await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-                        except Exception:
-                            pass
+                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
                 except Exception:
                     pass
                 AUDIO_CHANGE_FILE.pop(uid, None)
@@ -1192,142 +1101,134 @@ async def cancel_task_cb(c, cb):
         await cb.answer("কোনো অপারেশন চলছে না।", show_alert=True)
 
 # ---- main processing and upload (functions simplified for brevity, assuming they work) ----
-
-# Helper function for thumbnail generation
-async def generate_video_thumbnail(video_path: Path, thumb_path: Path, timestamp_sec: int) -> bool:
+async def generate_video_thumbnail(video_path: Path, thumb_path: Path, timestamp_sec: int = 1):
     try:
-        # Use ffmpeg to extract a frame at the specified timestamp
         cmd = [
-            'ffmpeg',
-            '-i', str(video_path),
-            '-ss', str(timestamp_sec),
-            '-vframes', '1',
-            '-f', 'mjpeg',
-            '-vcodec', 'mjpeg',
-            '-y', str(thumb_path)
+            "ffmpeg",
+            "-y",
+            "-i", str(video_path),
+            "-ss", str(timestamp_sec),
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            str(thumb_path)
         ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.wait()
-
-        if thumb_path.exists():
-            img = Image.open(thumb_path)
-            img.thumbnail((320, 320))
-            img = img.convert("RGB")
-            img.save(thumb_path, "JPEG")
-            return True
-        return False
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return thumb_path.exists() and thumb_path.stat().st_size > 0
     except Exception as e:
-        logger.error(f"Thumbnail generation failed: {e}")
-        delete_file(thumb_path)
+        logger.warning("Thumbnail generate error: %s", e)
         return False
 
-# Helper function to convert to mkv
-async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message) -> tuple[bool, str]:
+async def convert_to_mkv(in_path: Path, out_path: Path, status_msg: Message):
     try:
+        try:
+            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        except Exception:
+            await status_msg.edit("ভিডিওটি MKV ফরম্যাটে কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+        # Use simple stream copy first
         cmd = [
-            'ffmpeg',
-            '-i', str(in_path),
-            '-c', 'copy', # Stream copy
-            '-map', '0', # Map all streams
-            '-f', 'matroska', # Force mkv format
-            '-y', str(out_path)
+            "ffmpeg",
+            "-i", str(in_path),
+            "-codec", "copy",
+            str(out_path)
         ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        # Use communicate for simple, non-progress-tracked processes
-        _, stderr = await process.communicate()
         
-        if process.returncode == 0 and out_path.exists():
-            return True, None
-        else:
-            delete_file(out_path)
-            return False, stderr.decode().strip()
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=1200)
+        
+        if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+            # Fallback to full re-encoding if stream copy fails
+            logger.warning("Container conversion failed or output is empty, attempting full re-encoding.")
+            try:
+                await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
+            except Exception:
+                await status_msg.edit("ভিডিওটি MKV ফরম্যাটে পুনরায় এনকোড করা হচ্ছে...", reply_markup=progress_keyboard())
             
+            # Remove failed output before re-encoding
+            out_path.unlink(missing_ok=True) 
+
+            cmd_full = [
+                "ffmpeg",
+                "-i", str(in_path),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "copy",
+                "-map_metadata", "0", # Keep metadata from input
+                "-movflags", "+faststart", # For MP4
+                str(out_path)
+            ]
+            result_full = subprocess.run(cmd_full, capture_output=True, text=True, check=False, timeout=3600)
+            if result_full.returncode != 0:
+                raise Exception(f"Full re-encoding failed: {result_full.stderr}")
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise Exception("Converted file not found or is empty.")
+        
+        return True, None
     except Exception as e:
-        logger.error(f"MKV conversion failed: {e}")
-        delete_file(out_path)
+        logger.error(f"Video conversion error: {e}")
         return False, str(e)
 
 
-# DB CHANGE: process_dynamic_caption is now asynchronous and accepts user_data
-async def process_dynamic_caption(uid, caption_template, user_data):
-    if not caption_template:
-        return ""
-        
-    # DB CHANGE: Load user state from the fetched user_data
-    db_counters = user_data.get('counters', {'uploads': 0, 'dynamic_counters': {}, 're_options_count': 0})
-    
-    # Initialize/Reset the structure if needed
-    if 'uploads' not in db_counters:
-        db_counters = {'uploads': 0, 'dynamic_counters': {}, 're_options_count': 0}
+def process_dynamic_caption(uid, caption_template):
+    # Initialize user state if it doesn't exist
+    if uid not in USER_COUNTERS:
+        USER_COUNTERS[uid] = {'uploads': 0, 'episode_numbers': {}, 'dynamic_counters': {}, 're_options_count': 0}
 
     # Increment upload counter for the current user
-    db_counters['uploads'] += 1
+    USER_COUNTERS[uid]['uploads'] += 1
 
     # --- 1. Quality Cycle Logic (e.g., [re (480p, 720p, 1080p)]) ---
     quality_match = re.search(r"\[re\s*\((.*?)\)\]", caption_template)
-    quality_placeholder_replaced = False
-
     if quality_match:
         options_str = quality_match.group(1)
         options = [opt.strip() for opt in options_str.split(',')]
         
-        # Store the number of options if not already stored or if options changed
-        if db_counters.get('re_options_count') != len(options):
-            db_counters['re_options_count'] = len(options)
-            # Reset uploads count to start cycle fresh if options change
-            db_counters['uploads'] = 1 
-            
+        # Store the number of options if not already stored
+        if not USER_COUNTERS[uid]['re_options_count']:
+            USER_COUNTERS[uid]['re_options_count'] = len(options)
+        
         # Calculate the current index in the cycle
-        current_index = (db_counters['uploads'] - 1) % len(options)
+        current_index = (USER_COUNTERS[uid]['uploads'] - 1) % len(options)
         current_quality = options[current_index]
         
         # Replace the placeholder with the current quality
         caption_template = caption_template.replace(quality_match.group(0), current_quality)
-        quality_placeholder_replaced = True
 
-        # Check if a full cycle has completed and increment counters (This logic should be applied only if a cycle has truly completed)
-        if (db_counters['uploads'] - 1) % db_counters['re_options_count'] == 0 and db_counters['uploads'] > 1:
+        # Check if a full cycle has completed and increment counters
+        # Increment happens when we are about to start a new cycle (i.e., when (uploads - 1) % len == 0, but for uploads > 1)
+        if (USER_COUNTERS[uid]['uploads'] - 1) % USER_COUNTERS[uid]['re_options_count'] == 0 and USER_COUNTERS[uid]['uploads'] > 1:
             # Increment all dynamic counters
-            for key in db_counters['dynamic_counters']:
-                db_counters['dynamic_counters'][key]['value'] += 1
-    
-    
+            for key in USER_COUNTERS[uid]['dynamic_counters']:
+                USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
+    elif USER_COUNTERS[uid]['uploads'] > 1: # Increment all counters if no quality cycle is used
+        for key in USER_COUNTERS[uid].get('dynamic_counters', {}):
+             USER_COUNTERS[uid]['dynamic_counters'][key]['value'] += 1
+
+
     # --- 2. Main counter logic (e.g., [12], [(21)]) ---
     # Find all number-based placeholders
     counter_matches = re.findall(r"\[\s*(\(?\d+\)?)\s*\]", caption_template)
     
-    # Initialize counters on the first upload or if the structure is empty/mismatched
-    if db_counters.get('uploads', 0) <= 1 or not db_counters.get('dynamic_counters'):
-        # Only initialize if it's the very first upload or no counters were saved
-        db_counters['dynamic_counters'] = {} 
+    # Initialize counters on the first upload
+    if USER_COUNTERS[uid]['uploads'] == 1:
         for match in counter_matches:
+            # Check if the number has parentheses
             has_paren = match.startswith('(') and match.endswith(')')
+            # Clean the number to use as a key
             clean_match = re.sub(r'[()]', '', match)
             # Store the original format and the starting value
-            db_counters['dynamic_counters'][match] = {'value': int(clean_match), 'has_paren': has_paren}
-            
-    # If no quality cycle was used, auto-increment the dynamic counters (except on first upload)
-    elif db_counters.get('uploads', 0) > 1 and not quality_placeholder_replaced:
-        for key in db_counters.get('dynamic_counters', {}):
-             db_counters['dynamic_counters'][key]['value'] += 1
-
+            USER_COUNTERS[uid]['dynamic_counters'][match] = {'value': int(clean_match), 'has_paren': has_paren}
+    
+    # If not first upload but no quality cycle, the counter has already been incremented above. 
+    # If the quality cycle is used, the increment happens inside the quality cycle logic.
 
     # Replace placeholders with their current values
-    for match, data in db_counters.get('dynamic_counters', {}).items():
+    for match, data in USER_COUNTERS[uid]['dynamic_counters'].items():
         value = data['value']
         has_paren = data['has_paren']
         
         # Format the number with leading zeros if necessary (02, 03, etc.)
+        # Use the length of the original match to determine padding (e.g., '[01]' should be 2 digits)
         original_num_len = len(re.sub(r'[()]', '', match))
         formatted_value = f"{value:0{original_num_len}d}"
 
@@ -1340,11 +1241,16 @@ async def process_dynamic_caption(uid, caption_template, user_data):
 
     # --- 3. New Conditional Text Logic (e.g., [End (02)], [hi (05)]) ---
     
+    # Find the current episode number. We assume the smallest starting number counter 
+    # (e.g. from [01]) represents the episode number.
     current_episode_num = 0
-    # Determine the current episode number based on the dynamic counter with the smallest value (assuming it's the episode counter)
-    if db_counters.get('dynamic_counters'):
-        current_episode_num = min(data['value'] for data in db_counters['dynamic_counters'].values())
+    # Find the smallest starting value among dynamic counters to represent the "episode number"
+    if USER_COUNTERS[uid].get('dynamic_counters'):
+        current_episode_num = min(data['value'] for data in USER_COUNTERS[uid]['dynamic_counters'].values())
 
+    # New regex to find [TEXT (XX)] format. 
+    # Group 1: TEXT (e.g., End, hi)
+    # Group 2: XX (e.g., 02, 05)
     conditional_matches = re.findall(r"\[([a-zA-Z0-9\s]+)\s*\((.*?)\)\]", caption_template)
 
     for match in conditional_matches:
@@ -1356,18 +1262,17 @@ async def process_dynamic_caption(uid, caption_template, user_data):
         try:
             target_num = int(target_num_str)
         except ValueError:
+            # Invalid number, skip or replace with empty string
             caption_template = re.sub(placeholder, "", caption_template)
             continue
         
+        # FIX: New logic - show TEXT only if current_episode_num IS EQUAL TO target_num
         if current_episode_num == target_num:
             # Replace placeholder with the actual TEXT
             caption_template = re.sub(placeholder, text_to_add, caption_template)
         else:
             # Replace placeholder with an empty string
             caption_template = re.sub(placeholder, "", caption_template)
-
-    # DB CHANGE: Save the updated counter state back to MongoDB
-    await save_user_data(uid, {'counters': db_counters})
 
     # Final formatting
     return "**" + "\n".join(caption_template.splitlines()) + "**"
@@ -1380,20 +1285,18 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
     
     upload_path = in_path
     temp_thumb_path = None
-    messages_to_delete = messages_to_delete or []
-    
-    # DB CHANGE: Get user data
-    user_data = await get_user_data(uid)
-    
-    final_caption_template = user_data.get('caption')
+    final_caption_template = USER_CAPTIONS.get(uid)
 
     try:
+        # NOTE: original_name is already the desired final name due to changes in calling functions
         final_name = original_name or in_path.name
         
+        # সংশোধিত লাইন: Pyrogram-এর ডিটেকশন ব্যর্থ হলেও ফাইলের এক্সটেনশন দেখে ভিডিও হিসেবে চিহ্নিত করবে।
         video_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
         is_video = bool(m.video) or any(in_path.suffix.lower() == ext for ext in video_exts)
         
         if is_video:
+            # Only convert if it's NOT .mp4 OR .mkv, as mkv is the preferred format for video/document
             if in_path.suffix.lower() not in {".mp4", ".mkv"}:
                 mkv_path = TMP / f"{in_path.stem}.mkv"
                 try:
@@ -1410,14 +1313,14 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         await m.reply_text(f"কনভার্সন ব্যর্থ: {err}\nমূল ফাইলটি আপলোড করা হচ্ছে...", reply_markup=None)
                 else:
                     upload_path = mkv_path
+                    # Since we successfully converted to MKV, the final name must reflect this extension
                     final_name = Path(final_name).stem + ".mkv" 
         
-        # DB CHANGE: Get thumb path and time
-        thumb_path = user_data.get('thumb_path')
+        thumb_path = USER_THUMBS.get(uid)
         
         if is_video and not thumb_path:
             temp_thumb_path = TMP / f"thumb_{uid}_{int(datetime.now().timestamp())}.jpg"
-            thumb_time_sec = user_data.get('thumb_time', 1) # Default to 1 second
+            thumb_time_sec = USER_THUMB_TIME.get(uid, 1) # Default to 1 second
             ok = await generate_video_thumbnail(upload_path, temp_thumb_path, timestamp_sec=thumb_time_sec)
             if ok:
                 thumb_path = str(temp_thumb_path)
@@ -1446,8 +1349,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
         
         caption_to_use = final_name
         if final_caption_template:
-            # DB CHANGE: Call async dynamic caption processor
-            caption_to_use = await process_dynamic_caption(uid, final_caption_template, user_data)
+            caption_to_use = process_dynamic_caption(uid, final_caption_template)
 
         upload_attempts = 3
         last_exc = None
@@ -1461,10 +1363,8 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         thumb=thumb_path,
                         duration=duration_sec,
                         supports_streaming=True,
-                        file_name=final_name, 
-                        parse_mode=ParseMode.MARKDOWN,
-                        progress=progress_callback,
-                        progress_args=(status_msg, cancel_event)
+                        file_name=final_name, # Pass the final name for video uploads
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await c.send_document(
@@ -1472,21 +1372,18 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                         document=str(upload_path),
                         file_name=final_name,
                         caption=caption_to_use,
-                        parse_mode=ParseMode.MARKDOWN,
-                        progress=progress_callback,
-                        progress_args=(status_msg, cancel_event)
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 
                 if messages_to_delete:
                     try:
+                        # Delete all tracked messages on SUCCESS
                         await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
                     except Exception:
                         pass
                 
                 last_exc = None
                 break
-            except asyncio.CancelledError:
-                raise # Re-raise CancelledError to handle in outer block
             except Exception as e:
                 last_exc = e
                 logger.warning("Upload attempt %s failed: %s", attempt, e)
@@ -1501,28 +1398,17 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 
         if last_exc:
             await m.reply_text(f"আপলোড ব্যর্থ: {last_exc}", reply_markup=None)
-
-    except asyncio.CancelledError:
-        if messages_to_delete:
-            try:
-                await c.delete_messages(chat_id=m.chat.id, message_ids=messages_to_delete)
-            except Exception:
-                pass
-        try:
-            if status_msg:
-                await status_msg.edit("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-        except Exception:
-            await m.reply_text("অপারেশন বাতিল করা হয়েছে।", reply_markup=None)
-
     except Exception as e:
         await m.reply_text(f"আপলোডে ত্রুটি: {e}")
     finally:
         try:
             # Clean up files
-            if upload_path != in_path:
-                delete_file(upload_path)
-            delete_file(in_path)
-            delete_file(temp_thumb_path)
+            if upload_path != in_path and upload_path.exists():
+                upload_path.unlink()
+            if in_path.exists():
+                in_path.unlink()
+            if temp_thumb_path and Path(temp_thumb_path).exists():
+                Path(temp_thumb_path).unlink()
             TASKS[uid].remove(cancel_event)
         except Exception:
             pass
@@ -1530,86 +1416,103 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
 # *** সংশোধিত: ব্রডকাস্ট কমান্ড ***
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd_no_reply(c, m: Message):
-    if not is_admin(m.from_user.id):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই।")
         return
-        
-    if not m.command or len(m.command) < 2:
-        await m.reply_text("ব্যবহার: /broadcast <text>")
+    if not m.reply_to_message:
+        await m.reply_text("ব্রডকাস্ট করতে যেকোনো মেসেজে (ছবি, ভিডিও বা টেক্সট) **রিপ্লাই করে** এই কমান্ড দিন।")
         return
-    
-    text = m.text.split(None, 1)[1]
-    
-    success_count = 0
-    fail_count = 0
-    
-    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} জন সাবস্ক্রাইবারের কাছে...")
-    
-    for uid in list(SUBSCRIBERS):
-        try:
-            await c.send_message(uid, text)
-            success_count += 1
-        except Exception:
-            fail_count += 1
-            SUBSCRIBERS.discard(uid) # Remove failed subscriber
-            
-    await m.reply_text(f"ব্রডকাস্ট সম্পন্ন!\nসফল: {success_count}\nব্যর্থ: {fail_count}")
 
 @app.on_message(filters.command("broadcast") & filters.private & filters.reply)
 async def broadcast_cmd_reply(c, m: Message):
-    if not is_admin(m.from_user.id):
-        return
-        
-    reply_msg = m.reply_to_message
-    if not reply_msg:
-        await m.reply_text("একটি মেসেজে রিপ্লাই করে কমান্ডটি ব্যবহার করুন।")
+    uid = m.from_user.id
+    if not is_admin(uid):
+        await m.reply_text("আপনার অনুমতি নেই।")
         return
     
-    success_count = 0
-    fail_count = 0
-    
-    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} জন সাবস্ক্রাইবারের কাছে...")
-    
-    for uid in list(SUBSCRIBERS):
+    source_message = m.reply_to_message
+    if not source_message:
+        await m.reply_text("ব্রডকাস্ট করার জন্য একটি মেসেজে রিপ্লাই করে এই কমান্ড দিন।")
+        return
+
+    await m.reply_text(f"ব্রডকাস্ট শুরু হচ্ছে {len(SUBSCRIBERS)} সাবস্ক্রাইবারে...", quote=True)
+    failed = 0
+    sent = 0
+    for chat_id in list(SUBSCRIBERS):
+        if chat_id == m.chat.id:
+            continue
         try:
-            await reply_msg.copy(chat_id=uid)
-            success_count += 1
-        except Exception:
-            fail_count += 1
-            SUBSCRIBERS.discard(uid) # Remove failed subscriber
-            
-    await m.reply_text(f"ব্রডকাস্ট সম্পন্ন!\nসফল: {success_count}\nব্যর্থ: {fail_count}")
+            await c.forward_messages(chat_id=chat_id, from_chat_id=source_message.chat.id, message_ids=source_message.id)
+            sent += 1
+            await asyncio.sleep(0.08)
+        except Exception as e:
+            failed += 1
+            logger.warning("Broadcast to %s failed: %s", chat_id, e)
+
+    await m.reply_text(f"ব্রডকাস্ট শেষ। পাঠানো: {sent}, ব্যর্থ: {failed}")
 
 # --- Flask Web Server ---
 @flask_app.route('/')
 def home():
-    # Simple check to confirm the service is running
-    return render_template_string("Bot is running! Hello from Flask.")
+    html_content = """
+    <!DOCTYPE-html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Bot Status</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f0f2f5;
+                color: #333;
+                text-align: center;
+                padding-top: 50px;
+            }
+            .container {
+                background-color: #fff;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                display: inline-block;
+            }
+            h1 {
+                color: #28a745;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>TA File Share Bot is running! ✅</h1>
+            <p>This page confirms that the bot's web server is active.</p>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html_content)
 
 # Ping service to keep the bot alive
 def ping_service():
     if not RENDER_EXTERNAL_HOSTNAME:
-        # Assuming that RENDER_EXTERNAL_HOSTNAME is set via env var
-        logger.error("Render URL is not set. Ping service is disabled.")
+        print("Render URL is not set. Ping service is disabled.")
         return
 
     url = f"http://{RENDER_EXTERNAL_HOSTNAME}"
     while True:
         try:
             response = requests.get(url, timeout=10)
-            logger.info(f"Pinged {url} | Status Code: {response.status_code}")
+            print(f"Pinged {url} | Status Code: {response.status_code}")
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error pinging {url}: {e}")
-        time.sleep(600) # Ping every 10 minutes (600 seconds)
+            print(f"Error pinging {url}: {e}")
+        time.sleep(600)
 
 def run_flask_and_ping():
-    # Start Flask app
     flask_thread = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False))
     flask_thread.start()
-    
-    # Start Ping service
     ping_thread = threading.Thread(target=ping_service)
     ping_thread.start()
-    logger.info("Flask and Ping services started.")
+    print("Flask and Ping services started.")
 
 async def periodic_cleanup():
     while True:
@@ -1618,14 +1521,13 @@ async def periodic_cleanup():
             for p in TMP.iterdir():
                 try:
                     if p.is_file():
-                        # Delete files older than 3 days
                         if now - datetime.fromtimestamp(p.stat().st_mtime) > timedelta(days=3):
                             p.unlink()
                 except Exception:
                     pass
         except Exception:
             pass
-        await asyncio.sleep(3600) # Check every hour (3600 seconds)
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     print("Bot চালু হচ্ছে... Flask and Ping threads start করা হচ্ছে, তারপর Pyrogram চালু হবে।")
