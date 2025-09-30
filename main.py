@@ -668,9 +668,9 @@ async def store_command(client: Client, message: Message):
     # Start the flow: Ask for store name
     USER_STORE_FLOW[user_id] = {"command": "store", "state": STORE_STATE_STORE_NAME, "data": {}}
     
+    # *** ForceReply সরানো হলো ***
     await message.reply_text(
-        "নতুন **Store Name** দেওয়ার জন্য একটি মেসেজ পাঠান।",
-        reply_markup=ForceReply(selective=True)
+        "নতুন **Store Name** দেওয়ার জন্য একটি মেসেজ পাঠান।"
     )
 
 # --- /Set_Store COMMAND ---
@@ -688,9 +688,9 @@ async def set_store_command(client: Client, message: Message):
     # Start the flow: Ask for store name to set
     USER_STORE_FLOW[user_id] = {"command": "set_store", "state": SET_STORE_STATE_NAME, "data": {}}
     
+    # *** ForceReply সরানো হলো ***
     await message.reply_text(
-        "যে **Store Name**-এর Thumbnail এবং Caption পরিবর্তন করতে চান, সেটি দিন।",
-        reply_markup=ForceReply(selective=True)
+        "যে **Store Name**-এর Thumbnail এবং Caption পরিবর্তন করতে চান, সেটি দিন।"
     )
 
 # --- /delete_Store COMMAND ---
@@ -708,9 +708,9 @@ async def delete_store_command(client: Client, message: Message):
     # Start the flow: Ask for store name to delete
     USER_STORE_FLOW[user_id] = {"command": "delete_store", "state": DELETE_STORE_STATE_NAME, "data": {}}
     
+    # *** ForceReply সরানো হলো ***
     await message.reply_text(
-        "যে **Store Name** টি **Delete** করতে চান, সেটি দিন।",
-        reply_markup=ForceReply(selective=True)
+        "যে **Store Name** টি **Delete** করতে চান, সেটি দিন।"
     )
 
 # --- /View_Store COMMAND ---
@@ -744,20 +744,21 @@ async def handle_store_add_flow(client: Client, message: Message, user_id, flow,
         store_name = (message.text or "").strip()
         if not store_name:
             await message.reply_text("Store Name ফাঁকা হতে পারে না। আবার চেষ্টা করুন।")
-            return
+            return True # Flow handled: True
         
         if await db.get_store(store_name):
             clear_user_flow(user_id)
             await message.reply_text(f"**Store** `{store_name}` ইতিমধ্যেই সেভ করা আছে। নতুন নাম দিয়ে চেষ্টা করুন বা `/Set_Store` ব্যবহার করে এটিকে আপডেট করুন।")
-            return
+            return True # Flow handled: True
 
         flow["data"]["name"] = store_name
         flow["state"] = STORE_STATE_STORE_THUMB
         
+        # *** ForceReply সরানো হলো ***
         await message.reply_text(
-            f"**Store Name** `{store_name}` সেভ করা হয়েছে। এবার **Thumbnail** (Image) দিন।",
-            reply_markup=ForceReply(selective=True)
+            f"**Store Name** `{store_name}` সেভ করা হয়েছে। এবার **Thumbnail** (Image) দিন।"
         )
+        return True # Flow handled: True
         
     elif current_state == STORE_STATE_STORE_THUMB:
         file_id = None
@@ -770,21 +771,22 @@ async def handle_store_add_flow(client: Client, message: Message, user_id, flow,
         
         if not file_id:
             await message.reply_text("অনুগ্রহ করে একটি **Image** (Thumbnail) পাঠান।")
-            return
+            return True # Flow handled: True
         
         flow["data"]["file_id"] = file_id
         flow["state"] = STORE_STATE_STORE_CAPTION
         
+        # *** ForceReply সরানো হলো ***
         await message.reply_text(
-            "Thumbnail সেভ করা হয়েছে। এবার এই Store-এর জন্য **Caption** দিন।",
-            reply_markup=ForceReply(selective=True)
+            "Thumbnail সেভ করা হয়েছে। এবার এই Store-এর জন্য **Caption** দিন।"
         )
+        return True # Flow handled: True
 
     elif current_state == STORE_STATE_STORE_CAPTION:
         caption = message.text or message.caption or ""
         if not caption:
              await message.reply_text("Caption ফাঁকা হতে পারে না। আবার চেষ্টা করুন।")
-             return
+             return True # Flow handled: True
         
         store_name = flow["data"]["name"]
         file_id = flow["data"]["file_id"]
@@ -821,7 +823,10 @@ async def handle_store_add_flow(client: Client, message: Message, user_id, flow,
                 )
         else:
              await message.reply_text(f"❌ **Store** `{store_name}` সেভ করার সময় ত্রুটি হয়েছে।")
-
+        
+        return True # Flow handled: True
+    
+    return False # Flow not handled
 
 async def handle_store_delete_flow(client: Client, message: Message, user_id, flow, current_state):
     
@@ -829,7 +834,7 @@ async def handle_store_delete_flow(client: Client, message: Message, user_id, fl
         store_name = (message.text or "").strip()
         if not store_name:
             await message.reply_text("Store Name ফাঁকা হতে পারে না। আবার চেষ্টা করুন।")
-            return
+            return True # Flow handled: True
         
         success = await db.delete_store(store_name)
         clear_user_flow(user_id)
@@ -838,7 +843,10 @@ async def handle_store_delete_flow(client: Client, message: Message, user_id, fl
             await message.reply_text(f"✅ **Store** `{store_name}` সাফল্যের সাথে **Delete** করা হয়েছে এবং MongoDB Database থেকে মুছে গেছে।")
         else:
             await message.reply_text(f"❌ **Store** `{store_name}` নামে কোনো সেভ করা **Store** খুঁজে পাওয়া যায়নি।")
-
+        
+        return True # Flow handled: True
+    
+    return False # Flow not handled
 
 async def handle_store_set_flow(client: Client, message: Message, user_id, flow, current_state):
     
@@ -846,21 +854,22 @@ async def handle_store_set_flow(client: Client, message: Message, user_id, flow,
         store_name = (message.text or "").strip()
         if not store_name:
             await message.reply_text("Store Name ফাঁকা হতে পারে না। আবার চেষ্টা করুন।")
-            return
+            return True # Flow handled: True
         
         store_data = await db.get_store(store_name)
         if not store_data:
             clear_user_flow(user_id)
             await message.reply_text(f"❌ **Store** `{store_name}` নামে কোনো সেভ করা **Store** খুঁজে পাওয়া যায়নি।")
-            return
+            return True # Flow handled: True
 
         flow["data"]["name"] = store_name
         flow["state"] = STORE_STATE_STORE_THUMB 
         
+        # *** ForceReply সরানো হলো ***
         await message.reply_text(
-            f"**Store** `{store_name}` আপডেট করার জন্য নতুন **Thumbnail** (Image) দিন।",
-            reply_markup=ForceReply(selective=True)
+            f"**Store** `{store_name}` আপডেট করার জন্য নতুন **Thumbnail** (Image) দিন।"
         )
+        return True # Flow handled: True
         
     elif current_state == STORE_STATE_STORE_THUMB:
         file_id = None
@@ -873,21 +882,22 @@ async def handle_store_set_flow(client: Client, message: Message, user_id, flow,
         
         if not file_id:
             await message.reply_text("অনুগ্রহ করে একটি **Image** (Thumbnail) পাঠান।")
-            return
+            return True # Flow handled: True
         
         flow["data"]["file_id"] = file_id
         flow["state"] = STORE_STATE_STORE_CAPTION 
         
+        # *** ForceReply সরানো হলো ***
         await message.reply_text(
-            "নতুন Thumbnail সেভ করা হয়েছে। এবার এই Store-এর জন্য **নতুন Caption** দিন।",
-            reply_markup=ForceReply(selective=True)
+            "নতুন Thumbnail সেভ করা হয়েছে। এবার এই Store-এর জন্য **নতুন Caption** দিন।"
         )
+        return True # Flow handled: True
 
     elif current_state == STORE_STATE_STORE_CAPTION:
         caption = message.text or message.caption or ""
         if not caption:
              await message.reply_text("Caption ফাঁকা হতে পারে না। আবার চেষ্টা করুন।")
-             return
+             return True # Flow handled: True
         
         store_name = flow["data"]["name"]
         file_id = flow["data"]["file_id"]
@@ -906,37 +916,44 @@ async def handle_store_set_flow(client: Client, message: Message, user_id, flow,
             )
         else:
              await message.reply_text(f"❌ **Store** `{store_name}` আপডেট করার সময় ত্রুটি হয়েছে।")
+        
+        return True # Flow handled: True
+    
+    return False # Flow not handled
 
 
-# --- General Message Handler for Store Flow ---
-
-@app.on_message(filters.private & filters.reply)
-async def handle_store_flow_reply(client: Client, message: Message):
+# --- NEW: General Message Handler for Store Flow (No ForceReply/No Reply Filter) ---
+# এটি সব ব্যক্তিগত মেসেজ প্রসেস করবে যখন একটি Store Flow চালু থাকবে।
+@app.on_message(filters.private & ~filters.command(["start", "help", "upload_url", "setthumb", "view_thumb", "del_thumb", "set_caption", "view_caption", "edit_caption_mode", "rename", "mkv_video_audio_change", "mode_check", "broadcast", "Store", "Set_Store", "View_Store", "delete_Store"]))
+async def handle_store_flow_message(client: Client, message: Message):
     user_id = message.from_user.id
     
-    # Check if a store flow is active AND if it's a reply to the bot
-    if user_id in USER_STORE_FLOW and message.reply_to_message and message.reply_to_message.from_user.id == client.me.id:
-        
-        # Check if the reply is a ForceReply, which is used for all store commands
-        if not message.reply_to_message.reply_markup or not isinstance(message.reply_to_message.reply_markup, ForceReply):
-            # This is a reply to another bot message, not a store flow message
-            return
-        
-        flow = USER_STORE_FLOW[user_id]
-        current_state = flow["state"]
+    if user_id in USER_STORE_FLOW:
         
         if not is_admin(user_id):
             clear_user_flow(user_id)
-            await message.reply_text("আপনার অনুমতি নেই এই কমান্ডগুলো চালানোর।")
             return
+
+        flow = USER_STORE_FLOW[user_id]
+        current_state = flow["state"]
+        
+        handled = False
         
         if flow["command"] == "store":
-            await handle_store_add_flow(client, message, user_id, flow, current_state)
+            handled = await handle_store_add_flow(client, message, user_id, flow, current_state)
         elif flow["command"] == "delete_store":
-            await handle_store_delete_flow(client, message, user_id, flow, current_state)
+            handled = await handle_store_delete_flow(client, message, user_id, flow, current_state)
         elif flow["command"] == "set_store":
-            await handle_store_set_flow(client, message, user_id, flow, current_state)
-    # The existing text_handler will catch generic text messages (like URLs or audio track order)
+            handled = await handle_store_set_flow(client, message, user_id, flow, current_state)
+
+        # যদি flow হ্যান্ডেল হয়, তাহলে মেসেজটিকে অন্য হ্যান্ডলারের কাছে যাওয়া থেকে আটকানো হবে।
+        if handled:
+            # Pyrogram-এ, একটি মেসেজকে প্রোপাগেশন থেকে আটকাতে সাধারণত exception raise করতে হয়,
+            # কিন্তু এখানে শুধু অন্য হ্যান্ডলারে যাওয়ার আগে রিটার্ন করলে হয়, কারণ filters.text-এর
+            # চেয়ে এই হ্যান্ডলারের filter বেশি general.
+            return
+
+# --- Existing Handlers ---
 
 @app.on_message(filters.text & filters.private)
 async def text_handler(c, m: Message):
@@ -1011,10 +1028,6 @@ async def text_handler(c, m: Message):
             AUDIO_CHANGE_FILE.pop(uid, None)
             return
     # -----------------------------------------------------
-
-    # --- Check for Store Flow Reply: Store flow commands use ForceReply, so they should be caught by handle_store_flow_reply, but if not, this is a fallback.
-    # Since handle_store_flow_reply uses filters.reply, a generic text message here won't be a reply.
-    # We only process if it is NOT a reply, and does not have an active store flow.
 
     # Handle auto URL upload
     if text.startswith("http://") or text.startswith("https://"):
@@ -1198,6 +1211,8 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
     uid = m.from_user.id
     if not is_admin(uid):
         return
+        
+    # Store flow is handled by handle_store_flow_message first
 
     # --- Check for MKV Audio Change Mode first ---
     if uid in MKV_AUDIO_CHANGE_MODE:
