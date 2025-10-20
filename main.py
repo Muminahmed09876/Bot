@@ -247,7 +247,7 @@ def generate_post_caption(data: dict) -> str:
     
     # Start the quote block with the header
     collapsible_text_parts = [
-        f"> **\{image_name}\ All Season List :-**", 
+        f"> **{image_name} All Season List :-**", 
         "> " # ফাঁকা লাইন যোগ
     ]
     
