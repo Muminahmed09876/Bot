@@ -405,8 +405,10 @@ async def photo_handler(c, m: Message):
     # --- NEW LOGIC FOR CREATE POST MODE ---
     if uid in CREATE_POST_MODE and POST_CREATION_DATA.get(uid, {}).get('step') == 'wait_for_image':
         
-        # Pyrogram automatically handles the download, we just need the file info.
-        original_file_name = m.photo.file_name or "post_image.jpg"
+        # FIX: The Pyrogram Photo object does not have file_name. 
+        # We construct a safe, unique placeholder name with .jpg extension.
+        original_file_name = f"post_image_{m.photo.file_unique_id}.jpg" 
+        
         new_name_with_ext = generate_post_filename(original_file_name)
         
         # New: Use the standardized name for the downloaded file path
