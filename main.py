@@ -109,7 +109,7 @@ def generate_new_filename(original_name: str) -> str:
         
     return BASE_NEW_NAME + file_ext
 
-# --- UTILITY: Generate Post Caption (NEW) ---
+# --- UTILITY: Generate Post Caption (UPDATED) ---
 def generate_post_caption(data: dict) -> str:
     """Generates the full caption based on the post_data with required formatting."""
     image_name = data.get('image_name', DEFAULT_POST_DATA['image_name'])
@@ -132,15 +132,13 @@ def generate_post_caption(data: dict) -> str:
                     start, end = end, start
                 for i in range(start, end + 1):
                     # Use two digits padding for season numbers (e.g. 01, 02)
-                    # *UPDATED: Removed {image_name} to simplify season entry*
-                    season_entries.append(f"**Season {i:02d}**")
+                    season_entries.append(f"**{image_name} Season {i:02d}**") # CHANGE: Included image_name
             except ValueError:
                 continue
         else:
             try:
                 num = int(part)
-                # *UPDATED: Removed {image_name} to simplify season entry*
-                season_entries.append(f"**Season {num:02d}**")
+                season_entries.append(f"**{image_name} Season {num:02d}**") # CHANGE: Included image_name
             except ValueError:
                 continue
 
@@ -169,18 +167,17 @@ def generate_post_caption(data: dict) -> str:
     # The quote block mimics a collapsible section in standard Telegram Markdown.
     
     # Start the quote block with the header
-    # *UPDATED: Removed quotes around {image_name} and added the desired blank line after the header*
     collapsible_text_parts = [
-        f"> **{image_name} All Season List :-**", 
-        "> "
+        f"> **\"{image_name}\" All Season List :-**", 
+        "> " # ফাঁকা লাইন যোগ
     ]
     
-    # *UPDATED: Added a blank line "> " after each season entry*
+    # Add each season entry, prepending a quote character '>' and adding a blank line after it.
     for line in season_text.split('\n'):
         collapsible_text_parts.append(f"> {line}") # Season line
         collapsible_text_parts.append("> ") # Blank line after season
         
-    # *NEW: Remove the final extra blank line added by the loop*
+    # Remove the extra blank quote line added after the last season/Coming Soon... entry
     if collapsible_text_parts and collapsible_text_parts[-1] == "> ":
         collapsible_text_parts.pop()
         
