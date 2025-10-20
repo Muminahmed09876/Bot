@@ -395,6 +395,7 @@ async def del_thumb_cmd(c, m: Message):
         await m.reply_text("আপনার থাম্বনেইল/থাম্বনেইল তৈরির সময় মুছে ফেলা হয়েছে।")
 
 
+# *** সংশোধিত: Forwarded Photo হ্যান্ডেল করার জন্য Photo Handler ***
 @app.on_message(filters.photo & filters.private)
 async def photo_handler(c, m: Message):
     if not is_admin(m.from_user.id):
@@ -403,14 +404,18 @@ async def photo_handler(c, m: Message):
 
     # --- NEW LOGIC FOR CREATE POST MODE ---
     if uid in CREATE_POST_MODE and POST_CREATION_DATA.get(uid, {}).get('step') == 'wait_for_image':
+        
+        # Pyrogram automatically handles the download, we just need the file info.
         original_file_name = m.photo.file_name or "post_image.jpg"
         new_name_with_ext = generate_post_filename(original_file_name)
         
         # New: Use the standardized name for the downloaded file path
-        out = TMP / f"{new_name_with_ext}_{uid}_{int(datetime.now().timestamp())}"
+        # Ensure the path is unique and safe for the file system
+        safe_base_name = new_name_with_ext.replace('[','').replace(']','').replace(' ','_').strip('_')
+        out = TMP / f"{safe_base_name}_{uid}_{int(datetime.now().timestamp())}.jpg"
         
         try:
-            # 1. Download the photo
+            # 1. Download the photo (handles both direct and forwarded photos)
             await m.download(file_name=str(out))
             
             # 2. Convert to JPEG and resize for consistent post image
@@ -456,6 +461,8 @@ async def photo_handler(c, m: Message):
             await m.reply_text(f"থাম্বনেইল সেভ করতে সমস্যা: {e}")
     else:
         pass
+# *** শেষ সংশোধিত Photo Handler ***
+
 
 # Handlers for caption
 @app.on_message(filters.command("set_caption") & filters.private)
