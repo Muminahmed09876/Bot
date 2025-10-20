@@ -1646,8 +1646,8 @@ if __name__ == "__main__":
         # Run cleanup task in the event loop
         loop = asyncio.get_event_loop()
         loop.create_task(periodic_cleanup())
-        # Block until Pyrogram client disconnects
-        app.join()
+        # Block until Pyrogram client disconnects (CORRECTION APPLIED HERE)
+        loop.run_forever() 
     except KeyboardInterrupt:
         print("Bot বন্ধ হচ্ছে...")
     except Exception as e:
